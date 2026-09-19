@@ -182,16 +182,20 @@ func expectMatches(_ region: Region, _ want: Bitmap, _ label: String,
     let got = rendered(region)
     #expect(got.drawn == want.drawn, "\(label): pixels", sourceLocation: sourceLocation)
 
-    #expect(canonicalFormViolation(region) == nil, "\(label): canonical form",
-            sourceLocation: sourceLocation)
+    if let violation = canonicalFormViolation(region) {
+        Issue.record("\(label): canonical form: \(violation)", sourceLocation: sourceLocation)
+    }
 
     #expect(region.isEmpty == want.isEmpty, "\(label): isEmpty", sourceLocation: sourceLocation)
     #expect(region.bounds == want.bounds, "\(label): bounds", sourceLocation: sourceLocation)
 
     for y in Int32(-1)...Bitmap.size {
         for x in Int32(-1)...Bitmap.size where region.contains(x, y) != want[x, y] {
-            Issue.record("\(label): contains(\(x),\(y)) says \(region.contains(x, y)), "
-                       + "the bitmap says \(want[x, y])", sourceLocation: sourceLocation)
+            // Built as a String first: `Issue.record` takes a `Comment`, and concatenating
+            // two literals with `+` resolves against the wrong overload.
+            let detail: String = "\(label): contains(\(x),\(y)) says \(region.contains(x, y)), "
+                       + "the bitmap says \(want[x, y])"
+            Issue.record("\(detail)", sourceLocation: sourceLocation)
             return
         }
     }
@@ -497,7 +501,9 @@ struct RegionCanonicalFormTests {
                     Region(rect(r.x0 + shift, r.y0 + shift, r.x1 + shift, r.y1 + shift)))
             }
 
-            #expect(canonicalFormViolation(shifted) == nil, "seed \(seed): canonical form")
+            if let violation = canonicalFormViolation(shifted) {
+                Issue.record("seed \(seed): canonical form: \(violation)")
+            }
             #expect(shifted.rects == positive.rects.map {
                 rect($0.x0 + shift, $0.y0 + shift, $0.x1 + shift, $0.y1 + shift)
             }, "seed \(seed): the shifted region is not a translate of the original")
@@ -510,9 +516,10 @@ struct RegionCanonicalFormTests {
             for y in want.y0..<want.y1 {
                 for x in want.x0..<want.x1 where
                     shifted.contains(x + shift, y + shift) != positive.contains(x, y) {
-                    Issue.record("seed \(seed): contains(\(x + shift),\(y + shift)) in the "
+                    let detail: String = "seed \(seed): contains(\(x + shift),\(y + shift)) in the "
                                + "shifted region disagrees with contains(\(x),\(y)) in the "
-                               + "original")
+                               + "original"
+                    Issue.record("\(detail)")
                     return
                 }
             }
@@ -573,7 +580,9 @@ struct RegionScaleTests {
                     Region(rect(tx * 256, ty * 256, tx * 256 + 256, ty * 256 + 256)))
             }
         }
-        #expect(canonicalFormViolation(patches) == nil)
+        if let violation = canonicalFormViolation(patches) {
+            Issue.record("patch list: \(violation)")
+        }
         #expect(!patches.isEmpty)
         #expect(tiles == 78, "the generator is deterministic; a change here invalidates the rest")
         // Merging is the whole point of the representation: adjacent tiles have to collapse
@@ -582,7 +591,9 @@ struct RegionScaleTests {
 
         let view = rect(300, 700, 2500, 3100)
         let clipped = patches.intersecting(view)
-        #expect(canonicalFormViolation(clipped) == nil)
+        if let violation = canonicalFormViolation(clipped) {
+            Issue.record("clipped patch list: \(violation)")
+        }
         #expect(clipped.count <= patches.count)
 
         let bounds = clipped.bounds
