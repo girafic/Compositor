@@ -56,3 +56,15 @@ jobs:
       # out-of-bounds assumptions actually bite, so release is not optional here.
       - name: Build and test (release)
         run: swift build -c release && swift test -c release
+
+  # Answers the two questions Milestone 2's design rests on: what geometry Foundation already vends
+  # on Linux, and whether a SwiftPM target may be called CoreGraphics. Reports rather than gates --
+  # a FAIL in its output is a finding, and the job stays green either way.
+  toolchain-probe:
+    name: Toolchain probe
+    runs-on: ubuntu-24.04
+    container:
+      image: swift:6.4.0-noble@sha256:64bab762bc73a3fda6d9ebc559258bd6d7660c10a705bb25ecacad2f99d066f9
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash Spikes/probe-linux-swift.sh
