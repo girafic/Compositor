@@ -1,77 +1,80 @@
-# Compositor
+# Compositor for Linux
 
-Adobe Photoshop costs too much and tools like GIMP don’t feel familiar enough for me to stay in flow. That’s why I built Compositor.
+A Linux port of [Compositor](https://github.com/robbietilton/Compositor), a free and open-source
+image editor built around a Photoshop-style compositing workflow — layers, masks, selections,
+non-destructive transforms, adjustment layers and filters.
 
-The goal was to create a full-featured image editor that is completely free and open source. I use Photoshop for compositing and post-processing, so Compositor is built around that workflow - with the tools needed to create a pixel-perfect final image.
+> **This branch is a hard fork.** It targets Linux only. The macOS app lives on `main` and is built
+> with Xcode; nothing on this branch builds it, and fixes do not flow between the two.
+>
+> **It does not run yet.** The port is staged, and only the pixel kernels are wired up so far. See
+> [Status](#status).
 
-Because it’s open source, you can download the Xcode project and add, remove, or modify any feature to fit your workflow.
+## Status
 
-## Features
+The macOS app is ~24,000 lines of Swift on AppKit, SwiftUI, CoreGraphics, CoreImage, Vision, Metal
+and Accelerate. Replacing that stack is a long job, so it is being done in milestones, each of them
+verified by CI rather than by assertion.
 
-### Layers
-- Layers and folders, with blend modes and opacity
-- Layer masks: paint, fill, invert, blur and feather them; link or unlink them to transform a mask on its own
-- Clipping masks and folder masks
-- Adjustment layers: Hue/Saturation, Levels, Curves, Exposure, Gradient Map and Grain
-- Merge Down, Merge Layers and Merge Group (⌘E)
-- Duplicate, rename inline, reorder and nest by drag and drop; Option-drag to duplicate
-- Drag layers between open projects
+| Milestone | What it delivers | State |
+|---|---|---|
+| **M1** | SwiftPM build, CI, the eight C pixel kernels building and tested on Linux | **done** |
+| M2 | A CoreGraphics replacement (own compositor in C, Cairo for path coverage) and the headless document renderer | next |
+| M3 | Image codecs (libpng/libjpeg-turbo/libtiff/lcms2), the CoreImage filters as C kernels, `.comp` v8 | |
+| M4 | `compositor-cli` — open a project, render it, export PNG/JPEG — plus a golden-image determinism suite | |
+| M5 | GTK4 shell and canvas | |
+| M6 | Panels and the layer list | |
+| M7 | Flatpak/AppImage packaging, ONNX background removal, Vulkan compute brush | |
 
-### Transform
-- Non-destructive move, scale, rotate and flip — images keep their full resolution however small you make them
-- Free distort (⌘-drag a handle), with Shift to lock to an axis
-- Transform several layers, or a whole folder, together
-- Snapping to canvas and layer edges and centers, with guides
-- Exact values for position, size, scale and angle, stepped with the arrow keys
-- Flip Layer and Flip Canvas, horizontal and vertical
-
-### Selections
-- Rectangle and Ellipse Marquee, Freehand and Polygonal Lasso, and Magic Wand
-- Add to and subtract from selections, move the outline, or move and duplicate the pixels inside
-- Load a layer's pixels or a mask as a selection
-- Content-Aware Fill, which can also extend an image past its edges
-
-### Painting and retouching
-- Brush with size, hardness and opacity, and Shift for straight lines
-- Spot Healing Brush (content-aware)
-- Clone Stamp, aligned or not, sampling one layer or all of them
-- Blur tool, on pixels or masks
-- Gradient tool and Shape tool (rectangles, rounded rectangles and ellipses)
-- Eyedropper and a full color picker
-
-### Adjustments and filters
-- Levels (with Auto), Curves, Hue/Saturation, Exposure, Gradient Map, Grain and Invert
-- Gaussian Blur and Motion Blur that spread past a layer's edges
-- Add Noise, Lens Correction and Remove Background
-- Live previews, limited to the selection when there is one
-
-### Canvas and files
-- Multiple projects in tabs
-- Crop with snapping, and Option for symmetric cropping
-- Canvas Size and Image Size
-- Sharp high-quality downsampling when zoomed out, and a pixel grid when zoomed in
-- Import JPEG, PNG, HEIC and TIFF — including dropped screenshots and images from other apps
-- Export JPEG with a live preview (⇧⌥⌘S); Copy Merged
-- Photoshop-style keyboard shortcuts throughout
-
-## Requirements
-
-- macOS 26
-- Xcode 26 (to build from source)
+Nothing here is a working editor before M5. M4 is the first artifact that does something useful.
 
 ## Building
 
-Open `Compositor.xcodeproj` and run the **Compositor** scheme.
+Needs a Swift 6 toolchain. Nothing else yet — M1 has no system dependencies.
 
-## Releasing
+```sh
+swift build
+swift test
+```
 
-`scripts/release.sh` builds a Release version, signs it with Developer ID, notarizes and staples it, and packages it into `dist/Compositor-<version>.dmg`.
+Later milestones add `libcairo2-dev libpng-dev libturbojpeg0-dev libtiff-dev liblcms2-dev
+libzip-dev` and, from M5, `libgtk-4-dev`. All of them are packaged in Ubuntu 24.04 and Debian 13.
 
-It needs, all kept outside this repository:
+CI runs on a digest-pinned `swift:6.4.0-noble` container, in both debug and release — the kernels
+are hand-written pointer code, and optimised builds are where aliasing assumptions bite.
 
-- a **Developer ID Application** certificate in the login keychain
-- notarization credentials saved with `xcrun notarytool store-credentials "compositor-notary" …`
-- [`create-dmg`](https://github.com/create-dmg/create-dmg) (`brew install create-dmg`)
+## Layout
+
+```
+Sources/CCompositorKernels/   The eight pixel kernels, carried over from macOS unchanged.
+                              Plain C99 with no Apple headers, so they port verbatim; SwiftPM's
+                              umbrella module map over include/ replaces the Xcode bridging header.
+Tests/CKernelTests/           Behavioural tests pinning those kernels before the renderer is
+                              rebuilt on top of them.
+Compositor/                   The macOS sources still awaiting a port: the document model
+                              (Document/), the renderer's portable half (Rendering/) and
+                              persistence (IO/). M2 and M3 move these into Sources/.
+Attic/appkit/                 AppKit- and SwiftUI-bound code kept as a reference for the GTK
+                              rewrite. Not compiled, and deleted at 1.0.
+docs/                         Project format and notes. project-format.md is behind the code
+                              (it documents v1–6; ProjectStore writes v7) and is corrected in M3.
+```
+
+## What changes on Linux
+
+Some things cannot be carried across, and are better stated up front than discovered:
+
+- **Remove Background** used Vision's foreground-*instance* mask. No open model does instance
+  segmentation of generic foregrounds; the replacement (ONNX + BiRefNet) produces a single saliency
+  map, so choosing between subjects goes away. Landing in M7.
+- **`.comp` becomes a ZIP archive** (manifest version 8) instead of a directory. macOS could make a
+  directory look like one file; Linux cannot, and a single file is what makes an atomic
+  save genuinely atomic. Projects from versions 1–7 still open.
+- **Color Dodge and Color Burn render correctly.** CoreGraphics blends both wrong with respect to
+  source alpha — the macOS app already works around it — so output differs from macOS for those two
+  modes over translucent pixels.
+- **No auto-update.** Sparkle has no Linux counterpart; updates come from Flatpak or the distro.
+- **Cursors are the theme's**, not the hand-drawn set the macOS build composes from SF Symbols.
 
 ## License
 
