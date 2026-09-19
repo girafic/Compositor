@@ -49,8 +49,13 @@ jobs:
           key: spm-${{ runner.os }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
           restore-keys: spm-${{ runner.os }}-
 
+      # Warnings are failures. A 10-month port accumulates them silently otherwise, and the
+      # first one to matter will be buried under fifty that do not.
       - name: Build (debug)
-        run: swift build -c debug
+        run: |
+          set -o pipefail
+          swift build -c debug 2>&1 | tee build.log
+          ! grep -q 'warning:' build.log
 
       - name: Test
         run: swift test -c debug

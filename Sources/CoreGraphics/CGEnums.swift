@@ -63,7 +63,7 @@ public struct CGBitmapInfo: OptionSet, Sendable, Hashable {
 
     public static let alphaInfoMask = CGBitmapInfo(rawValue: 0x1F)
     public static let byteOrderMask = CGBitmapInfo(rawValue: 0x7000)
-    public static let byteOrderDefault = CGBitmapInfo(rawValue: 0)
+    public static let byteOrderDefault: CGBitmapInfo = []
     public static let byteOrder16Little = CGBitmapInfo(rawValue: 1 << 12)
     public static let byteOrder32Little = CGBitmapInfo(rawValue: 2 << 12)
     public static let byteOrder16Big = CGBitmapInfo(rawValue: 3 << 12)

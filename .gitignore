@@ -18,3 +18,4 @@ build/
 
 # Claude Code settings personal to this machine
 .claude/settings.local.json
+build.log
