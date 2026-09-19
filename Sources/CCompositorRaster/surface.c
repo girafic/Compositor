@@ -154,6 +154,13 @@ bool raster_surface_make_unique(raster_surface *surface) {
     if (!surface) return false;
     if (raster_surface_is_unique(surface)) return true;
 
+    // A borrowed store must never be detached. The caller's buffer *is* the destination —
+    // quietly copying away from it would strand every subsequent write somewhere the caller
+    // never looks. The one borrowed surface in the app is the eyedropper's 1x1 context
+    // (ColorPalette.sampleCompositeColor), which would silently start returning nothing.
+    // Callers that need a private copy of a borrowed surface must ask for one explicitly.
+    if (!surface->store->owned) return false;
+
     // Copy only this surface's own window, not the whole parent allocation. A crop view
     // that separates from its parent should not drag the parent's memory along — that is
     // the retention leak BrushStroke.paintSnapshot works around by hand today.

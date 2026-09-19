@@ -1,7 +1,12 @@
 # Spikes
 
-Experiments that answer a design question before the design depends on it. Each one is
-self-contained and re-runnable; none of them is part of the shipping build.
+Experiments that answer a design question before the design depends on it, plus the standalone
+C harnesses that verify the engine in ways CI cannot. Each one is self-contained and
+re-runnable; none of them is part of the shipping build.
+
+CI runs the Swift test suite under a Swift toolchain, which is the wrong place to reach for
+valgrind, AddressSanitizer or a five-way optimisation sweep. Those live here instead, as plain
+C programs that link one engine source directly.
 
 ## `halving-invariant.c` — does Lanczos-3 fit the tiling margin budget?
 
@@ -47,6 +52,62 @@ Consequences for M2:
 ```sh
 clang -std=gnu11 -O2 -Wall -Wextra Spikes/halving-invariant.c -lm -o /tmp/halving && /tmp/halving
 ```
+
+## `region-oracle.c` — does `region.c` agree with a brute-force bitmap?
+
+**Answered: yes. 60,085 checks, 0 failures**, on two compilers and five optimisation levels,
+clean under valgrind and under gcc's AddressSanitizer + UndefinedBehaviorSanitizer.
+
+Random rectangles on a 32×32 grid, with every region operation checked against a plain
+`bool[32][32]`: union, intersect, subtract, xor, `bounds`, `contains` (probed one pixel outside
+the grid on every side), `is_empty`, `copy` and `intersect_rect`. After every operation the
+result is also checked against the canonical form the header promises — sorted bands, no
+touching or overlapping rectangles within a band, no two vertically adjacent bands with
+identical x-intervals — because that form is what makes `raster_region_bounds` exact and what
+makes two regions covering the same pixels compare equal rectangle-for-rectangle.
+
+`Tests/CRasterTests/RegionTests.swift` carries the same assertions into CI. This file exists
+for what CI cannot do:
+
+```sh
+clang -std=gnu11 -Wall -Wextra -Werror -O1 -ISources/CCompositorRaster/include \
+  Spikes/region-oracle.c Sources/CCompositorRaster/region.c -o /tmp/region-oracle
+valgrind --error-exitcode=99 --leak-check=full --errors-for-leak-kinds=all -q /tmp/region-oracle
+
+# clang in this container ships no sanitizer runtimes; gcc does.
+gcc -std=gnu11 -Wall -Wextra -Werror -O2 -fsanitize=address,undefined \
+  -fno-sanitize-recover=all -ISources/CCompositorRaster/include \
+  Spikes/region-oracle.c Sources/CCompositorRaster/region.c -o /tmp/region-asan && /tmp/region-asan
+```
+
+### It was mutation-tested, because passing on the first run is not evidence
+
+Twenty-four single-defect mutants were injected into `region.c` and the harness re-run.
+**Seventeen were caught**: every fill-rule predicate, a `bounds` that stops after the first
+rectangle, two off-by-ones in `contains`, dropping the band merge or any of its three
+conditions, leaving the band edges unsorted, a stale previous-band index, `copy` losing a
+rectangle, `intersect_rect` dispatching to the wrong operation, and dropping the requirement
+that a rectangle must span a strip to contribute to it — that last one does not fail so much as
+hang, on a rectangle count that never stops growing.
+
+The seven survivors are all genuinely undetectable rather than untested:
+
+- **Four are redundant guards.** Empty rectangles are rejected in both
+  `raster_region_create_rect` and `append`; zero-height strips are prevented by deduplicating
+  band edges, *and* skipped in the strip loop, *and* rejected by `append`. Removing both
+  empty-rectangle guards together **is** caught. Removing both zero-height guards is not — the
+  third one, in `append`, still covers it.
+- **Two are unreachable by construction**, and now say so in the source: the run-coalescing
+  branch in `append`, and the loop (rather than `if`) form of the edge toggles in
+  `combine_band`. Both are correct for inputs the current sweep cannot produce. They stay so the
+  helpers are right on their own terms instead of only in combination with the one caller that
+  happens to respect the invariant. The reachable half of that toggle logic — deciding only
+  after *both* interval lists are advanced past a shared coordinate — is very much covered:
+  breaking it fails 56,124 of the 60,085 checks.
+- **One is the `break` in `contains`**, a pure optimisation over `continue`.
+
+Four further mutants removed whole guard pairs at once, to tell a redundant guard from an
+untested one; the two results that matter are quoted above.
 
 ## `probe-linux-swift.sh` — what does the Linux toolchain actually vend?
 

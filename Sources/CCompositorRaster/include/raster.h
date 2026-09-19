@@ -122,6 +122,54 @@ bool raster_surface_is_unique(const raster_surface *surface);
 // snapshot, and draws that row back into the same context.
 bool raster_surface_make_unique(raster_surface *surface);
 
+// MARK: - Regions
+
+// A set of device pixels, held as y-bands of disjoint half-open rectangles.
+//
+// This is the rectilinear half of the clip. A graphics state's clip is a region plus an
+// optional coverage plane; keeping the rectilinear part exact matters because
+// `boundingBoxOfClipPath` is read as *geometry*, not as a hint — AdjustmentSurface sizes an
+// offscreen from it, and Grain anchors its noise pattern to the resulting origin, so a
+// loose bound visibly shifts the grain.
+//
+// Canonical form, maintained by every operation:
+//   - rectangles are sorted by y0, then x0;
+//   - rectangles sharing a y0 share a y1 (they form one band) and do not touch or overlap;
+//   - two vertically adjacent bands never have identical x-intervals (they get merged).
+// Two regions covering the same pixels therefore have identical rectangle lists.
+typedef struct { int32_t x0, y0, x1, y1; } raster_rect;  // half-open: x0 <= x < x1
+
+static inline bool raster_rect_is_empty(raster_rect r) { return r.x1 <= r.x0 || r.y1 <= r.y0; }
+
+typedef struct raster_region raster_region;
+
+raster_region *raster_region_create(void);                   // empty
+raster_region *raster_region_create_rect(raster_rect rect);  // empty rect gives an empty region
+raster_region *raster_region_copy(const raster_region *region);
+void raster_region_destroy(raster_region *region);
+
+bool raster_region_is_empty(const raster_region *region);
+// Exact, not conservative. All zeroes when empty.
+raster_rect raster_region_bounds(const raster_region *region);
+bool raster_region_contains(const raster_region *region, int32_t x, int32_t y);
+
+size_t raster_region_count(const raster_region *region);
+raster_rect raster_region_rect(const raster_region *region, size_t index);
+
+// Each returns a newly allocated region, or NULL if an allocation failed.
+//
+// `union` is what accumulating rectangles under the winding fill rule produces; `xor` is
+// what the even-odd rule produces, where an overlap of two added rectangles is *out*. Both
+// are needed: LayerRenderer builds its brush-preview clips with addRect + evenOdd, while
+// every other accumulation is winding.
+raster_region *raster_region_union(const raster_region *a, const raster_region *b);
+raster_region *raster_region_intersect(const raster_region *a, const raster_region *b);
+raster_region *raster_region_subtract(const raster_region *a, const raster_region *b);
+raster_region *raster_region_xor(const raster_region *a, const raster_region *b);
+
+// The hot path: clip(to: rect) under an axis-aligned transform.
+raster_region *raster_region_intersect_rect(const raster_region *region, raster_rect rect);
+
 // MARK: - Compositing
 
 // One source-over-with-blend of a single RGBA8 pixel.

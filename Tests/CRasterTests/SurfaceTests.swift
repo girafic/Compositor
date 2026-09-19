@@ -148,6 +148,29 @@ struct SurfaceCopyOnWriteTests {
         raster_surface_release(surface)
     }
 
+    @Test("a shared borrowed surface refuses to detach")
+    func borrowedNeverDetaches() throws {
+        // The eyedropper (ColorPalette.sampleCompositeColor) is the app's one context over
+        // caller-owned memory: it hands CGContext a 1x1 buffer, draws the whole document
+        // through a translated CTM, and reads the pixel back out of *its own* array. If
+        // copy-on-write quietly moved that context onto a private allocation, every draw
+        // would land somewhere the caller never looks and the eyedropper would return the
+        // untouched buffer — no error, no failing draw, just the wrong colour forever.
+        var bytes = [UInt8](repeating: 0, count: 16)
+        bytes.withUnsafeMutableBufferPointer { buffer in
+            let surface = raster_surface_create_borrowed(buffer.baseAddress, 4, 4, 4, Format.gray8)
+            defer { raster_surface_release(surface) }
+            let view = raster_surface_crop(surface, 0, 0, 2, 2)
+            defer { raster_surface_release(view) }
+
+            #expect(!raster_surface_is_unique(surface), "the crop shares the borrowed store")
+            #expect(!raster_surface_make_unique(surface),
+                    "detaching a borrowed store would strand every later write")
+            #expect(raster_surface_bytes(surface) == UnsafePointer(buffer.baseAddress!),
+                    "and the surface still points at the caller's buffer")
+        }
+    }
+
     @Test("an explicit copy is independent and tightly packed")
     func explicitCopy() throws {
         let surface = try #require(raster_surface_create(8, 4, Format.gray8))
