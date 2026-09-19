@@ -1,24 +1,20 @@
+# SwiftPM
+.build/
+.swiftpm/
+Package.resolved.lock
+
 # Build output
 dist/
 build/
-DerivedData/
-*.xcarchive
-*.dmg
 
-# Xcode per-user state
-xcuserdata/
-*.xcuserstate
-
-# macOS
+# Editors
 .DS_Store
+*.swp
+.vscode/
+.idea/
 
-# Signing material and secrets — never commit
-*.p12
-*.p8
-*.cer
-*.certSigningRequest
+# Secrets — never commit
 .env
 
 # Claude Code settings personal to this machine
 .claude/settings.local.json
-BUILD_PLAN.md

@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "claude/**"]
+  pull_request:
+  # So a new toolchain can be tried without an empty commit.
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned by digest, not by tag: this port runs for months and a silent toolchain bump would
+  # surface as an unrelated failure at the worst possible moment. Bump deliberately.
+  SWIFT_IMAGE: swift:6.4.0-noble@sha256:64bab762bc73a3fda6d9ebc559258bd6d7660c10a705bb25ecacad2f99d066f9
+
+jobs:
+  # The eight pixel kernels are the only part of the macOS renderer that ports verbatim, so they
+  # are the first thing CI pins down. This job is deliberately cheap and has no system
+  # dependencies — it should stay the fastest signal in the pipeline.
+  c-kernels:
+    name: C kernels
+    runs-on: ubuntu-24.04
+    container:
+      image: swift:6.4.0-noble@sha256:64bab762bc73a3fda6d9ebc559258bd6d7660c10a705bb25ecacad2f99d066f9
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: swift --version
+
+      # An explicit pass with -Werror, separate from the build, so a warning fails with a message
+      # that points straight at the line. gnu11 is the floor: HealPixels.c uses M_PI, which strict
+      # -std=c11 hides behind __STRICT_ANSI__.
+      - name: Warning gate
+        run: |
+          clang -fsyntax-only -std=gnu11 -Wall -Wextra -Werror \
+            -ISources/CCompositorKernels/include \
+            Sources/CCompositorKernels/*.c
+
+      - uses: actions/cache@v4
+        with:
+          path: .build
+          key: spm-${{ runner.os }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          restore-keys: spm-${{ runner.os }}-
+
+      - name: Build (debug)
+        run: swift build -c debug
+
+      - name: Test
+        run: swift test -c debug
+
+      # The kernels are hand-written pointer code. Optimised builds are where aliasing and
+      # out-of-bounds assumptions actually bite, so release is not optional here.
+      - name: Build and test (release)
+        run: swift build -c release && swift test -c release
