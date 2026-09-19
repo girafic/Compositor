@@ -50,17 +50,40 @@ clang -std=gnu11 -O2 -Wall -Wextra Spikes/halving-invariant.c -lm -o /tmp/halvin
 
 ## `probe-linux-swift.sh` — what does the Linux toolchain actually vend?
 
-Runs in CI as the `toolchain-probe` job, which reports and never gates.
+**Answered on Swift 6.4.0 / Ubuntu 24.04: 12 passed, 8 failed — and the failures are the useful
+part.** Runs in CI as the `toolchain-probe` job, which reports and never gates.
 
-Two questions decide the shape of M2's CoreGraphics replacement, and neither is answerable from
-documentation:
+### Foundation vends part of the geometry, not all of it
 
-1. **Does swift-corelibs-foundation already vend the CG geometry types?** If it does, our module has
-   to re-export them rather than declare them, or every call site gets an ambiguity error.
-2. **Can a SwiftPM target be named `CoreGraphics`?** That is what lets roughly 800 call sites and
-   288 tests port unmodified instead of being rewritten against a new name.
+| | on Linux |
+|---|---|
+| `CGFloat`, `CGPoint`, `CGSize`, `CGRect` | **provided** |
+| `CGRect.minX/maxY/midX/width/…`, `intersection`, `union`, `insetBy`, `offsetBy`, `isNull`, `isEmpty`, `integral`, `standardized`, `contains`, `intersects`, `.null`, `.zero` | **provided** |
+| `CGAffineTransform` | **missing** |
+| `CGVector` | **missing** |
+| `CGRect.applying(_:)`, `CGPoint.applying(_:)` | **missing** (they need `CGAffineTransform`) |
 
-It also checks `@Observable`, swift-testing, and `-default-isolation MainActor` — the flag that
-reproduces the Xcode project's `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`.
+So the split is now exact. `Sources/CoreGraphics/` must `@_exported import Foundation` to inherit
+the rect and point algebra — roughly a thousand occurrences across the codebase that then need no
+attention at all — and must itself declare `CGAffineTransform`, `CGVector`, and the two `applying`
+extensions, on top of `CGContext`, `CGImage`, `CGPath`, `CGColor`, `CGColorSpace`, `CGGradient` and
+`CGBlendMode`.
 
-Re-run it after any toolchain bump; the answers are version-dependent.
+Note the trap: swift-corelibs-foundation *does* have `AffineTransform` (from `NSAffineTransform`).
+It is a different type with different conventions and is not a substitute. The 26 `inverted()` and
+8 `concatenating()` call sites want `CGAffineTransform` semantics.
+
+### A SwiftPM target may be called `CoreGraphics`
+
+Confirmed by building one. There is no system `CoreGraphics` module on Linux to collide with — the
+`import CoreGraphics` probe fails, which is exactly what frees the name. The probe package also
+checks the part that actually matters: a *consumer* doing a single `import CoreGraphics` sees both
+our own declarations and everything Foundation re-exports through it. That is what lets ~800
+`context.*` call sites and 288 tests port unmodified rather than being rewritten against a new name.
+
+### Everything else M2 leans on works
+
+`@Observable`, swift-testing, and `-default-isolation MainActor` (the flag standing in for the Xcode
+project's `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`) all pass.
+
+Re-run after any toolchain bump; the answers are version-dependent.
