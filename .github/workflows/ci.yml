@@ -21,7 +21,7 @@ jobs:
   # are the first thing CI pins down. This job is deliberately cheap and has no system
   # dependencies — it should stay the fastest signal in the pipeline.
   c-kernels:
-    name: C kernels
+    name: C engine
     runs-on: ubuntu-24.04
     container:
       image: swift:6.4.0-noble@sha256:64bab762bc73a3fda6d9ebc559258bd6d7660c10a705bb25ecacad2f99d066f9
@@ -39,6 +39,9 @@ jobs:
           clang -fsyntax-only -std=gnu11 -Wall -Wextra -Werror \
             -ISources/CCompositorKernels/include \
             Sources/CCompositorKernels/*.c
+          clang -fsyntax-only -std=gnu11 -Wall -Wextra -Werror \
+            -ISources/CCompositorRaster/include \
+            Sources/CCompositorRaster/*.c
 
       - uses: actions/cache@v4
         with:
