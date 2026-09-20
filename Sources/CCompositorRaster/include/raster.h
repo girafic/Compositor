@@ -201,7 +201,9 @@ enum {
     // rather than approximated by a bounding box, for the same reason an unsupported blend
     // mode is rejected rather than silently drawn as Normal: a clip that fails *open* draws
     // pixels the caller asked to have masked away, and nothing downstream would catch it.
-    // The coverage plane in `raster_clip` is where this stops being a refusal.
+    // Lifting it needs something that can rasterise a rotated quadrilateral into the coverage
+    // plane, and something that can sample an image through a rotated transform. The plane on
+    // its own is only the place to put the answer, not a way to compute it.
     RASTER_UNSUPPORTED_TRANSFORM = 2,
 };
 
@@ -379,11 +381,34 @@ void          raster_context_reset_path(raster_context *ctx);
 
 raster_status raster_context_clip_rect(raster_context *ctx, raster_frect rect);
 
+// Intersects the clip with `rect` and attenuates it by `mask`'s grey values, sampled over that
+// rect at the current interpolation quality. This is CGContextClipToMask.
+//
+// Two halves that are easy to conflate: the *rectangle* clips hard, by the same device-pixel
+// centre rule as every other clip here, and the mask supplies all of the softness inside it.
+// Nested mask clips multiply -- a * b / 255 -- which is what makes a folder mask and a layer's
+// own mask compose the way the app expects.
+//
+// `mask` must be GRAY8. The app's masks are all DeviceGray with alphaInfo .none, and a colour
+// image would raise a question (its grey? its alpha?) that is better refused than guessed.
+//
+// Returns RASTER_UNSUPPORTED_TRANSFORM under a non-rectilinear CTM. That case is real rather
+// than theoretical -- LayerRenderer and FolderMaskClip both clip inside a rotate(by:) -- and it
+// needs the general affine sampler, not the coverage plane, so it is refused here and lifted
+// with the sampler. A clip that fails open draws pixels the caller asked to have masked away.
+raster_status raster_context_clip_mask(raster_context *ctx, const raster_surface *mask,
+                                       raster_frect rect);
+
 // The exact device bounds of the clip. False means the clip is empty, which the caller must
 // keep distinct from a degenerate rectangle: raster_region_bounds answers all-zeroes for an
 // empty region, and Swift has to turn "empty" into CGRect.null rather than CGRect.zero.
 // Selection builds an empty clip deliberately, and TiledLayerRenderer insets the result by
 // -64 — from .zero that would be a nonsense 128x128 rectangle at the origin.
+//
+// A mask clip contributes its *rectangle* and never its contents: a mask that happens to be
+// black along one edge does not shrink the bounds. This is read as geometry rather than as a
+// hint — AdjustmentSurface sizes an offscreen from it and Grain anchors its pattern to the
+// resulting origin — so it has to depend only on things the caller can predict.
 bool raster_context_clip_bounds(const raster_context *ctx, raster_rect *out);
 
 // For tests: the clip region itself, borrowed.

@@ -26,20 +26,28 @@
 typedef struct raster_clip {
     size_t refcount;
     raster_region *region;     // never NULL
-    raster_surface *coverage;  // NULL for now: 255 everywhere inside `region`
+    // NULL means 255 everywhere inside `region`, which is the common case and costs nothing.
+    // Otherwise GRAY8, positioned at exactly raster_region_bounds(region) and the same size.
+    // Tying it to the bounds rather than giving it its own origin removes a whole class of
+    // off-by-one: there is no second coordinate system to keep in step.
+    raster_surface *coverage;
 } raster_clip;
 
-// Takes ownership of `region`.
-static raster_clip *clip_create(raster_region *region) {
-    if (!region) return NULL;
+// Takes ownership of `region`, and of one reference to `coverage` (which may be NULL).
+static raster_clip *clip_create(raster_region *region, raster_surface *coverage) {
+    if (!region) {
+        raster_surface_release(coverage);
+        return NULL;
+    }
     raster_clip *clip = malloc(sizeof(raster_clip));
     if (!clip) {
         raster_region_destroy(region);
+        raster_surface_release(coverage);
         return NULL;
     }
     clip->refcount = 1;
     clip->region = region;
-    clip->coverage = NULL;
+    clip->coverage = coverage;
     return clip;
 }
 
@@ -95,7 +103,7 @@ raster_context *raster_context_create(raster_surface *target) {
     if (!ctx) return NULL;
 
     raster_rect bounds = { 0, 0, (int32_t)width, (int32_t)height };
-    raster_clip *clip = clip_create(raster_region_create_rect(bounds));
+    raster_clip *clip = clip_create(raster_region_create_rect(bounds), NULL);
     if (!clip) {
         free(ctx);
         return NULL;
@@ -233,6 +241,28 @@ raster_status raster_context_add_rect(raster_context *ctx, raster_frect rect) {
     return path_append(ctx, device) ? RASTER_OK : RASTER_OUT_OF_MEMORY;
 }
 
+// The existing plane, re-based onto `bounds`. Because the plane is always positioned at its
+// own region's bounds and `bounds` can only have shrunk, this is a crop view — no pixels move
+// and nothing is copied, which is what keeps saveGState/restoreGState around a tile loop cheap.
+//
+// Returns false only on allocation failure; a NULL plane in, or an empty region, gives a NULL
+// plane out, which is the "opaque inside the region" case and not an error.
+static bool coverage_rebase(const raster_clip *from, raster_rect bounds, raster_surface **out) {
+    *out = NULL;
+    if (!from->coverage) return true;
+    if (bounds.x1 <= bounds.x0 || bounds.y1 <= bounds.y0) return true;
+
+    raster_rect was = raster_region_bounds(from->region);
+    raster_surface *view = raster_surface_crop(from->coverage,
+                                               (size_t)(bounds.x0 - was.x0),
+                                               (size_t)(bounds.y0 - was.y0),
+                                               (size_t)(bounds.x1 - bounds.x0),
+                                               (size_t)(bounds.y1 - bounds.y0));
+    if (!view) return false;
+    *out = view;
+    return true;
+}
+
 // Replaces the clip with its intersection with `region`, which this takes ownership of.
 static raster_status clip_intersect(raster_context *ctx, raster_region *region) {
     if (!region) return RASTER_OUT_OF_MEMORY;
@@ -240,7 +270,13 @@ static raster_status clip_intersect(raster_context *ctx, raster_region *region) 
     raster_region_destroy(region);
     if (!narrowed) return RASTER_OUT_OF_MEMORY;
 
-    raster_clip *clip = clip_create(narrowed);
+    raster_surface *coverage;
+    if (!coverage_rebase(ctx->state.clip, raster_region_bounds(narrowed), &coverage)) {
+        raster_region_destroy(narrowed);
+        return RASTER_OUT_OF_MEMORY;
+    }
+
+    raster_clip *clip = clip_create(narrowed, coverage);
     if (!clip) return RASTER_OUT_OF_MEMORY;
     clip_release(ctx->state.clip);
     ctx->state.clip = clip;
@@ -285,6 +321,84 @@ raster_status raster_context_clip_rect(raster_context *ctx, raster_frect rect) {
         return clip_intersect(ctx, nothing);
     }
     return clip_intersect(ctx, raster_region_create_rect(device));
+}
+
+raster_status raster_context_clip_mask(raster_context *ctx, const raster_surface *mask,
+                                       raster_frect rect) {
+    if (!ctx) return RASTER_OK;
+    if (!mask || raster_surface_format(mask) != RASTER_GRAY8) return RASTER_UNSUPPORTED_TRANSFORM;
+
+    // Redundant on its own: raster_image_mapping below repeats this test and would refuse a
+    // rotation anyway, so removing this survives every test. It stays because it makes the
+    // refusal this function's own decision rather than a side effect of what a callee happens
+    // to check, and because the canonical matrix is wanted regardless.
+    raster_matrix canonical;
+    if (!raster_matrix_is_rectilinear(ctx->state.ctm, rect, &canonical))
+        return RASTER_UNSUPPORTED_TRANSFORM;
+
+    raster_matrix deviceToMask;
+    if (!raster_image_mapping(canonical, rect, raster_surface_width(mask),
+                              raster_surface_height(mask), &deviceToMask))
+        return RASTER_UNSUPPORTED_TRANSFORM;
+
+    // The rectangle clips hard, by the same centre rule as every other clip. Softness comes
+    // from the mask's own values and from nowhere else.
+    raster_rect device;
+    if (!raster_device_rect_covered(canonical, rect, &device)) {
+        raster_region *nothing = raster_region_create();
+        return clip_intersect(ctx, nothing);
+    }
+
+    raster_region *piece = raster_region_create_rect(device);
+    if (!piece) return RASTER_OUT_OF_MEMORY;
+    raster_region *narrowed = raster_region_intersect(ctx->state.clip->region, piece);
+    raster_region_destroy(piece);
+    if (!narrowed) return RASTER_OUT_OF_MEMORY;
+
+    raster_rect bounds = raster_region_bounds(narrowed);
+    if (raster_region_is_empty(narrowed)) {
+        raster_clip *empty = clip_create(narrowed, NULL);
+        if (!empty) return RASTER_OUT_OF_MEMORY;
+        clip_release(ctx->state.clip);
+        ctx->state.clip = empty;
+        return RASTER_OK;
+    }
+
+    size_t width = (size_t)(bounds.x1 - bounds.x0), height = (size_t)(bounds.y1 - bounds.y0);
+    raster_surface *plane = raster_surface_create(width, height, RASTER_GRAY8);
+    uint8_t *planeBytes = plane ? raster_surface_mutable_bytes(plane) : NULL;
+    if (!planeBytes) {
+        raster_surface_release(plane);
+        raster_region_destroy(narrowed);
+        return RASTER_OUT_OF_MEMORY;
+    }
+    size_t planeStride = raster_surface_stride(plane);
+
+    // The parent's plane is read, never written. That is the whole of the copy-on-write
+    // story: a nested clip builds its own plane, so a restoreGState finds the outer one
+    // exactly as it left it, with no versioning and no copy on the way in.
+    const raster_surface *parent = ctx->state.clip->coverage;
+    const uint8_t *parentBytes = parent ? raster_surface_bytes(parent) : NULL;
+    size_t parentStride = parent ? raster_surface_stride(parent) : 0;
+    raster_rect parentBounds = raster_region_bounds(ctx->state.clip->region);
+
+    raster_interpolation quality = ctx->state.interpolation;
+    for (size_t row = 0; row < height; ++row) {
+        int32_t y = bounds.y0 + (int32_t)row;
+        uint8_t *dst = planeBytes + row * planeStride;
+        raster_sample_row(mask, deviceToMask, bounds.x0, y, width, quality, dst);
+        if (!parentBytes) continue;
+        const uint8_t *src = parentBytes + (size_t)(y - parentBounds.y0) * parentStride
+                           + (size_t)(bounds.x0 - parentBounds.x0);
+        for (size_t x = 0; x < width; ++x)
+            dst[x] = (uint8_t)((dst[x] * src[x] + 127) / 255);
+    }
+
+    raster_clip *clip = clip_create(narrowed, plane);
+    if (!clip) return RASTER_OUT_OF_MEMORY;
+    clip_release(ctx->state.clip);
+    ctx->state.clip = clip;
+    return RASTER_OK;
 }
 
 bool raster_context_clip_bounds(const raster_context *ctx, raster_rect *out) {
@@ -368,6 +482,43 @@ static bool scratch_reserve(raster_context *ctx, size_t count) {
     return true;
 }
 
+// The clip's coverage plane, read-only, with the origin it is positioned at. `bytes` is NULL
+// when the clip is a plain region, which is the ordinary case.
+typedef struct {
+    const uint8_t *bytes;
+    size_t stride;
+    int32_t x0, y0;
+} coverage_plane;
+
+static coverage_plane clip_plane(const raster_clip *clip) {
+    coverage_plane plane = { NULL, 0, 0, 0 };
+    if (!clip->coverage) return plane;
+    plane.bytes = raster_surface_bytes(clip->coverage);
+    plane.stride = raster_surface_stride(clip->coverage);
+    raster_rect bounds = raster_region_bounds(clip->region);
+    plane.x0 = bounds.x0;
+    plane.y0 = bounds.y0;
+    return plane;
+}
+
+// Folds the plane into one row's coverage. `coverage` is what the edge antialiasing produced,
+// or NULL for "fully covered"; the answer is the same thing with the mask multiplied in.
+//
+// The NULL case is the one worth having: a hard-edged fill through a mask clip needs no
+// arithmetic at all, because the plane's row *is* the coverage. Only a soft edge crossing a
+// mask has to multiply, and then it does so into `scratch`.
+static const uint8_t *plane_apply(const coverage_plane *plane, uint8_t *scratch,
+                                  const uint8_t *coverage, int32_t x0, int32_t y, size_t count) {
+    if (!plane->bytes) return coverage;
+    const uint8_t *row = plane->bytes + (size_t)(y - plane->y0) * plane->stride
+                       + (size_t)(x0 - plane->x0);
+    if (!coverage) return row;
+    // scratch may alias `coverage`; every output depends only on the input at the same index.
+    for (size_t x = 0; x < count; ++x)
+        scratch[x] = (uint8_t)((coverage[x] * row[x] + 127) / 255);
+    return scratch;
+}
+
 // One fill, shared by fill_rect and clear_rect. `blend` and `alpha` are passed in rather
 // than read from the state because clear ignores both of the state's.
 static raster_status paint(raster_context *ctx, raster_frect rect, raster_blend blend,
@@ -419,6 +570,9 @@ static raster_status paint(raster_context *ctx, raster_frect rect, raster_blend 
     }
 
     const raster_region *clip = ctx->state.clip->region;
+    coverage_plane plane = clip_plane(ctx->state.clip);
+    if (plane.bytes && !scratch_reserve(ctx, (size_t)width * 2)) return RASTER_OUT_OF_MEMORY;
+
     size_t clipCount = raster_region_count(clip);
     for (size_t i = 0; i < clipCount; ++i) {
         raster_rect band = raster_region_rect(clip, i);
@@ -447,6 +601,7 @@ static raster_status paint(raster_context *ctx, raster_frect rect, raster_blend 
                     coverage = scaled;
                 }
             }
+            coverage = plane_apply(&plane, ctx->scratch + width, coverage, hit.x0, y, count);
             uint8_t *dst = pixels + (size_t)y * stride + (size_t)hit.x0 * bpp;
             if (format == RASTER_GRAY8)
                 raster_fill_row_gray(dst, gray, count, blend, alpha8, coverage);
@@ -524,6 +679,7 @@ raster_status raster_context_draw_image(raster_context *ctx, const raster_surfac
     if (antialias) raster_axis_coverage(box[0], box[2], area.x0, area.x1, columnCoverage);
 
     const raster_region *clip = ctx->state.clip->region;
+    coverage_plane plane = clip_plane(ctx->state.clip);
     size_t clipCount = raster_region_count(clip);
     for (size_t i = 0; i < clipCount; ++i) {
         raster_rect band = raster_region_rect(clip, i);
@@ -549,6 +705,7 @@ raster_status raster_context_draw_image(raster_context *ctx, const raster_surfac
                     coverage = scaledCoverage;
                 }
             }
+            coverage = plane_apply(&plane, scaledCoverage, coverage, hit.x0, y, count);
             raster_sample_row(image, deviceToImage, hit.x0, y, count,
                               ctx->state.interpolation, samples);
             uint8_t *dst = pixels + (size_t)y * stride + (size_t)hit.x0 * bpp;

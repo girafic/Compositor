@@ -1723,6 +1723,587 @@ static void test_crop_intersects(void) {
     raster_surface_release(surface);
 }
 
+// MARK: - Stage 4: mask clips and the coverage plane
+
+// BrushRaster.draw(image, in:, mask: true, context:) verbatim. Its shape is the point: fill
+// black, clip to the mask, fill white. On GRAY8 that is a lerp from 0 to 255 by the mask's
+// own value, so at 1:1 the result must come back equal to the mask, byte for byte.
+static void brush_raster_draw_mask(raster_context *ctx, const raster_surface *mask,
+                                   raster_frect rect) {
+    raster_context_save(ctx);
+    raster_context_set_interpolation(ctx, RASTER_INTERPOLATION_NONE);
+    // A bitmap context starts with CoreGraphics' flip already in its CTM and
+    // BrushRaster.context's translate(0,h) + scale(1,-1) cancels it exactly, leaving user
+    // space equal to device pixels. What remains is BrushRaster.draw's own flip.
+    raster_context_set_matrix(ctx, (raster_matrix){ 1, 0, 0, -1, rect.x, rect.y + rect.height });
+
+    raster_frect bounds = { 0, 0, rect.width, rect.height };
+    static const double black[4] = { 0, 0, 0, 1 };
+    static const double white[4] = { 1, 1, 1, 1 };
+    raster_context_set_fill_color(ctx, black);
+    raster_context_fill_rect(ctx, bounds);
+    CHECK(raster_context_clip_mask(ctx, mask, bounds) == RASTER_OK,
+          "the mask idiom's clip is accepted", NULL);
+    raster_context_set_fill_color(ctx, white);
+    raster_context_fill_rect(ctx, bounds);
+    raster_context_restore(ctx);
+}
+
+static void test_mask_idiom_reproduces_the_mask(void) {
+    static const struct { size_t w, h; } sizes[] = { { 8, 8 }, { 37, 23 }, { 1, 1 }, { 1, 9 }, { 9, 1 } };
+    for (size_t s = 0; s < sizeof sizes / sizeof sizes[0]; ++s) {
+        for (int antialias = 0; antialias <= 1; ++antialias) {
+            size_t w = sizes[s].w, h = sizes[s].h;
+            raster_surface *mask = raster_surface_create(w, h, RASTER_GRAY8);
+            uint8_t *mp = raster_surface_mutable_bytes(mask);
+            size_t mstride = raster_surface_stride(mask);
+            for (size_t y = 0; y < h; ++y)
+                for (size_t x = 0; x < w; ++x)
+                    mp[y * mstride + x] = (uint8_t)((x * 37 + y * 91) % 256);
+
+            raster_surface *target = raster_surface_create(w, h, RASTER_GRAY8);
+            raster_context *ctx = raster_context_create(target);
+            raster_context_set_antialias(ctx, antialias != 0);
+            brush_raster_draw_mask(ctx, mask, (raster_frect){ 0, 0, (double)w, (double)h });
+
+            const uint8_t *tp = raster_surface_bytes(target);
+            size_t tstride = raster_surface_stride(target);
+            bool same = true;
+            for (size_t y = 0; y < h && same; ++y)
+                for (size_t x = 0; x < w; ++x)
+                    if (tp[y * tstride + x] != mp[y * mstride + x]) {
+                        char buf[160];
+                        snprintf(buf, sizeof buf, "%zux%zu aa=%d at (%zu,%zu): got %u want %u",
+                                 w, h, antialias, x, y, tp[y * tstride + x], mp[y * mstride + x]);
+                        fail("the mask idiom must reproduce its mask exactly", buf);
+                        same = false;
+                        break;
+                    }
+            ++checks;
+            raster_context_destroy(ctx);
+            raster_surface_release(target);
+            raster_surface_release(mask);
+        }
+    }
+}
+
+// LayerMask.solid(revealing:) builds a 1x1 GRAY8 image and uses it as a clip over a whole
+// layer, so a mask has to stretch to any size and stay flat while doing it.
+static void test_one_by_one_mask_stretches(void) {
+    for (unsigned value = 0; value <= 255; value += 17) {
+        raster_surface *mask = raster_surface_create(1, 1, RASTER_GRAY8);
+        raster_surface_mutable_bytes(mask)[0] = (uint8_t)value;
+
+        raster_surface *target = raster_surface_create(11, 7, RASTER_GRAY8);
+        raster_context *ctx = raster_context_create(target);
+        install_identity(ctx);
+        raster_context_set_interpolation(ctx, RASTER_INTERPOLATION_HIGH);
+        static const double white[4] = { 1, 1, 1, 1 };
+        CHECK(raster_context_clip_mask(ctx, mask, (raster_frect){ 0, 0, 11, 7 }) == RASTER_OK,
+              "a 1x1 mask clips", NULL);
+        raster_context_set_fill_color(ctx, white);
+        raster_context_fill_rect(ctx, (raster_frect){ 0, 0, 11, 7 });
+
+        const uint8_t *tp = raster_surface_bytes(target);
+        size_t tstride = raster_surface_stride(target);
+        bool flat = true;
+        for (int y = 0; y < 7 && flat; ++y)
+            for (int x = 0; x < 11; ++x)
+                if (tp[(size_t)y * tstride + (size_t)x] != (uint8_t)value) { flat = false; break; }
+        ++checks;
+        if (!flat) {
+            char buf[120];
+            snprintf(buf, sizeof buf, "value %u gave %u at (0,0)", value, tp[0]);
+            fail("a 1x1 mask must stretch flat over the whole rect", buf);
+        }
+        raster_context_destroy(ctx);
+        raster_surface_release(target);
+        raster_surface_release(mask);
+    }
+}
+
+// A uniform mask of value v, so the expected coverage is exactly v and the arithmetic can be
+// checked in closed form rather than against another implementation of the same rounding.
+static raster_surface *uniform_mask(size_t w, size_t h, uint8_t value) {
+    raster_surface *mask = raster_surface_create(w, h, RASTER_GRAY8);
+    uint8_t *p = raster_surface_mutable_bytes(mask);
+    size_t stride = raster_surface_stride(mask);
+    for (size_t y = 0; y < h; ++y) memset(p + y * stride, value, w);
+    return mask;
+}
+
+static void test_nested_masks_multiply(void) {
+    // CoreGraphics multiplies nested mask clips, which is what makes a folder mask compose
+    // with a layer's own mask. LayerMask's own comment says so; this pins the arithmetic.
+    for (unsigned a = 0; a <= 255; a += 15)
+        for (unsigned b = 0; b <= 255; b += 15) {
+            raster_surface *outer = uniform_mask(8, 8, (uint8_t)a);
+            raster_surface *inner = uniform_mask(8, 8, (uint8_t)b);
+            raster_surface *target = raster_surface_create(8, 8, RASTER_GRAY8);
+            raster_context *ctx = raster_context_create(target);
+            install_identity(ctx);
+            static const double white[4] = { 1, 1, 1, 1 };
+            raster_frect all = { 0, 0, 8, 8 };
+            raster_context_clip_mask(ctx, outer, all);
+            raster_context_clip_mask(ctx, inner, all);
+            raster_context_set_fill_color(ctx, white);
+            raster_context_fill_rect(ctx, all);
+
+            uint8_t expected = (uint8_t)((a * b + 127) / 255);
+            uint8_t got = raster_surface_bytes(target)[0];
+            char buf[120];
+            snprintf(buf, sizeof buf, "%u then %u gave %u, expected %u", a, b, got, expected);
+            CHECK(got == expected, "nested mask clips multiply", buf);
+
+            raster_context_destroy(ctx);
+            raster_surface_release(target);
+            raster_surface_release(inner);
+            raster_surface_release(outer);
+        }
+}
+
+static void test_mask_clip_restores(void) {
+    // The parent's plane must survive a child's. Nothing here copies it -- a nested clip
+    // builds its own -- so what this really checks is that nothing writes through it.
+    raster_surface *outer = uniform_mask(8, 8, 200);
+    raster_surface *inner = uniform_mask(8, 8, 100);
+    raster_surface *target = raster_surface_create(8, 8, RASTER_GRAY8);
+    raster_context *ctx = raster_context_create(target);
+    install_identity(ctx);
+    static const double white[4] = { 1, 1, 1, 1 };
+    raster_frect all = { 0, 0, 8, 8 };
+    raster_context_set_fill_color(ctx, white);
+
+    raster_context_clip_mask(ctx, outer, all);
+    raster_context_save(ctx);
+    raster_context_clip_mask(ctx, inner, all);
+    raster_context_fill_rect(ctx, all);
+    uint8_t nested = raster_surface_bytes(target)[0];
+    raster_context_restore(ctx);
+
+    // Reset the canvas by hand rather than with clear_rect: clear honours the clip, so under
+    // the outer mask it would only partly erase and the second fill would measure the
+    // leftovers instead of the plane.
+    uint8_t *tp = raster_surface_mutable_bytes(target);
+    for (size_t row = 0; row < 8; ++row)
+        memset(tp + row * raster_surface_stride(target), 0, 8);
+    raster_context_fill_rect(ctx, all);
+    uint8_t restored = raster_surface_bytes(target)[0];
+
+    CHECK(nested == (uint8_t)((200 * 100 + 127) / 255), "the nested clip multiplied", NULL);
+    CHECK(restored == 200, "and restoreGState left the outer plane untouched", NULL);
+
+    raster_context_destroy(ctx);
+    raster_surface_release(target);
+    raster_surface_release(inner);
+    raster_surface_release(outer);
+}
+
+// The subtle one. A mask clip positions its plane at the region's bounds; a later rectangle
+// clip shrinks the region, and the plane has to be re-based onto the new bounds or every
+// lookup after it is offset. A uniform mask cannot catch that -- the values have to vary.
+static void test_plane_rebases_after_a_rect_clip(void) {
+    raster_surface *mask = raster_surface_create(16, 16, RASTER_GRAY8);
+    uint8_t *mp = raster_surface_mutable_bytes(mask);
+    size_t mstride = raster_surface_stride(mask);
+    for (size_t y = 0; y < 16; ++y)
+        for (size_t x = 0; x < 16; ++x)
+            mp[y * mstride + x] = (uint8_t)(x * 16 + y);
+
+    for (int trial = 0; trial < 2; ++trial) {
+        raster_surface *target = raster_surface_create(16, 16, RASTER_GRAY8);
+        raster_context *ctx = raster_context_create(target);
+        install_identity(ctx);
+        static const double white[4] = { 1, 1, 1, 1 };
+        raster_context_set_fill_color(ctx, white);
+
+        raster_frect all = { 0, 0, 16, 16 };
+        raster_frect inner = { 5, 3, 7, 9 };
+        // Once with the rectangle clip after the mask, once before: the plane is built over
+        // the already-narrowed region in the second case and cropped in the first, and both
+        // have to land on the same pixels.
+        if (trial == 0) {
+            raster_context_clip_mask(ctx, mask, all);
+            raster_context_clip_rect(ctx, inner);
+        } else {
+            raster_context_clip_rect(ctx, inner);
+            raster_context_clip_mask(ctx, mask, all);
+        }
+        raster_context_fill_rect(ctx, all);
+
+        const uint8_t *tp = raster_surface_bytes(target);
+        size_t tstride = raster_surface_stride(target);
+        for (int y = 0; y < 16; ++y)
+            for (int x = 0; x < 16; ++x) {
+                bool in = x >= 5 && x < 12 && y >= 3 && y < 12;
+                // A mask is placed exactly as a drawn image is, source row 0 at the rect's
+                // *maximum* y, so under an identity CTM it reads bottom-up. BrushRaster.draw
+                // uses one preamble for its mask branch and its image branch, which is what
+                // says the two placements are the same thing.
+                uint8_t want = in ? mp[(size_t)(15 - y) * mstride + (size_t)x] : 0;
+                uint8_t got = tp[(size_t)y * tstride + (size_t)x];
+                ++checks;
+                if (got != want) {
+                    char buf[160];
+                    snprintf(buf, sizeof buf, "trial %d at (%d,%d): got %u want %u",
+                             trial, x, y, got, want);
+                    fail("a mask plane must survive a later rectangle clip", buf);
+                    y = 16;
+                    break;
+                }
+            }
+        raster_context_destroy(ctx);
+        raster_surface_release(target);
+    }
+    raster_surface_release(mask);
+}
+
+static void test_mask_clip_applies_to_image_draws(void) {
+    // LayerRenderer clips to a mask and then draws an image through it, so the plane has to
+    // reach the image path and not only the fill path.
+    raster_surface *image = raster_surface_create(8, 8, RASTER_GRAY8);
+    uint8_t *ip = raster_surface_mutable_bytes(image);
+    size_t istride = raster_surface_stride(image);
+    for (size_t y = 0; y < 8; ++y) memset(ip + y * istride, 255, 8);
+
+    raster_surface *mask = uniform_mask(8, 8, 64);
+    raster_surface *target = raster_surface_create(8, 8, RASTER_GRAY8);
+    raster_context *ctx = raster_context_create(target);
+    install_identity(ctx);
+    raster_context_set_interpolation(ctx, RASTER_INTERPOLATION_NONE);
+    raster_frect all = { 0, 0, 8, 8 };
+    raster_context_clip_mask(ctx, mask, all);
+    // The image is drawn under the context's own flip, which puts source row 0 at the
+    // rect's maximum y; a uniform image makes that irrelevant and keeps this about coverage.
+    raster_context_draw_image(ctx, image, all);
+
+    CHECK(raster_surface_bytes(target)[0] == 64,
+          "a mask clip attenuates an image draw", NULL);
+
+    raster_context_destroy(ctx);
+    raster_surface_release(target);
+    raster_surface_release(mask);
+    raster_surface_release(image);
+}
+
+static void test_mask_clip_refusals(void) {
+    raster_surface *gray = uniform_mask(4, 4, 255);
+    raster_surface *colour = raster_surface_create(4, 4, RASTER_RGBA8);
+    raster_surface *target = raster_surface_create(8, 8, RASTER_GRAY8);
+    raster_context *ctx = raster_context_create(target);
+    install_identity(ctx);
+    raster_frect all = { 0, 0, 8, 8 };
+
+    CHECK(raster_context_clip_mask(ctx, colour, all) == RASTER_UNSUPPORTED_TRANSFORM,
+          "a colour mask is refused rather than guessed at", NULL);
+    CHECK(raster_context_clip_mask(ctx, NULL, all) == RASTER_UNSUPPORTED_TRANSFORM,
+          "so is a missing mask", NULL);
+
+    // A rotation: the app reaches this through LayerRenderer and FolderMaskClip, and it has
+    // to refuse rather than silently clip to an axis-aligned approximation.
+    raster_context_set_matrix(ctx, (raster_matrix){ 0.8, 0.6, -0.6, 0.8, 0, 0 });
+    CHECK(raster_context_clip_mask(ctx, gray, all) == RASTER_UNSUPPORTED_TRANSFORM,
+          "a rotated mask clip is refused", NULL);
+
+    // A quarter turn is rectilinear and must still be accepted.
+    raster_context_set_matrix(ctx, (raster_matrix){ 6.1e-17, 1, -1, 6.1e-17, 8, 0 });
+    CHECK(raster_context_clip_mask(ctx, gray, all) == RASTER_OK,
+          "a quarter turn is rectilinear and is accepted", NULL);
+
+    raster_context_destroy(ctx);
+    raster_surface_release(target);
+    raster_surface_release(colour);
+    raster_surface_release(gray);
+}
+
+static void test_mask_clip_bounds_ignore_the_mask(void) {
+    // boundingBoxOfClipPath is read as geometry: AdjustmentSurface sizes an offscreen from it
+    // and Grain anchors its pattern to the origin. A mask that is black along one edge must
+    // not move it, or the grain visibly shifts.
+    raster_surface *mask = raster_surface_create(8, 8, RASTER_GRAY8);
+    uint8_t *mp = raster_surface_mutable_bytes(mask);
+    size_t mstride = raster_surface_stride(mask);
+    for (size_t y = 0; y < 8; ++y)
+        for (size_t x = 0; x < 8; ++x)
+            mp[y * mstride + x] = (x < 3 || y < 2) ? 0 : 255;
+
+    raster_surface *target = raster_surface_create(8, 8, RASTER_GRAY8);
+    raster_context *ctx = raster_context_create(target);
+    install_identity(ctx);
+    raster_context_clip_mask(ctx, mask, (raster_frect){ 1, 1, 6, 6 });
+
+    raster_rect bounds;
+    CHECK(raster_context_clip_bounds(ctx, &bounds), "a mask clip is not an empty clip", NULL);
+    CHECK(bounds.x0 == 1 && bounds.y0 == 1 && bounds.x1 == 7 && bounds.y1 == 7,
+          "the bounds are the mask's rectangle, not its content", NULL);
+
+    raster_context_destroy(ctx);
+    raster_surface_release(target);
+    raster_surface_release(mask);
+}
+
+// The mask clip's *rectangle* clips hard, by the centre rule, exactly like every other clip
+// here. Antialiasing does not soften it -- softness comes only from the mask's values. With
+// integer edges the two rules agree, so this needs a fractional rectangle to say anything.
+static void test_mask_rect_clips_hard(void) {
+    raster_surface *mask = uniform_mask(16, 16, 255);
+    raster_surface *target = raster_surface_create(16, 16, RASTER_GRAY8);
+    raster_context *ctx = raster_context_create(target);
+    install_identity(ctx);
+    raster_context_set_antialias(ctx, true);
+    raster_context_set_interpolation(ctx, RASTER_INTERPOLATION_NONE);
+    static const double white[4] = { 1, 1, 1, 1 };
+    raster_context_set_fill_color(ctx, white);
+
+    raster_frect soft = { 2.4, 1.6, 5.2, 4.3 };
+    raster_context_clip_mask(ctx, mask, soft);
+    raster_context_save(ctx);
+    raster_context_set_antialias(ctx, false);
+    raster_context_fill_rect(ctx, (raster_frect){ 0, 0, 16, 16 });
+    raster_context_restore(ctx);
+
+    const uint8_t *tp = raster_surface_bytes(target);
+    size_t tstride = raster_surface_stride(target);
+    for (int y = 0; y < 16; ++y)
+        for (int x = 0; x < 16; ++x) {
+            // Centre in, or out. Nothing in between.
+            double cx = x + 0.5, cy = y + 0.5;
+            bool in = cx >= soft.x && cx < soft.x + soft.width
+                   && cy >= soft.y && cy < soft.y + soft.height;
+            uint8_t want = in ? 255 : 0;
+            uint8_t got = tp[(size_t)y * tstride + (size_t)x];
+            ++checks;
+            if (got != want) {
+                char buf[140];
+                snprintf(buf, sizeof buf, "at (%d,%d): got %u want %u", x, y, got, want);
+                fail("a mask clip's rectangle clips hard even with antialiasing on", buf);
+                y = 16;
+                break;
+            }
+        }
+    raster_context_destroy(ctx);
+    raster_surface_release(target);
+    raster_surface_release(mask);
+}
+
+// A soft fill edge crossing a mask has to multiply the two coverages, with the same rounding
+// as everywhere else. BrushRaster's contexts have antialiasing on and clip to masks, so this
+// combination is the app's normal case, not a corner.
+static void test_antialiased_fill_through_a_mask(void) {
+    for (unsigned value = 0; value <= 255; value += 5) {
+        raster_surface *mask = uniform_mask(16, 8, (uint8_t)value);
+        raster_surface *target = raster_surface_create(16, 8, RASTER_GRAY8);
+        raster_context *ctx = raster_context_create(target);
+        install_identity(ctx);
+        raster_context_set_interpolation(ctx, RASTER_INTERPOLATION_NONE);
+        raster_context_set_antialias(ctx, true);
+        static const double white[4] = { 1, 1, 1, 1 };
+        raster_context_set_fill_color(ctx, white);
+        raster_context_clip_mask(ctx, mask, (raster_frect){ 0, 0, 16, 8 });
+        // Fractional in x only, so every row is fully covered and the column coverage is the
+        // whole story.
+        raster_context_fill_rect(ctx, (raster_frect){ 1.3, 0, 4.1, 8 });
+
+        uint8_t columns[16];
+        raster_axis_coverage(1.3, 5.4, 0, 16, columns);
+
+        const uint8_t *tp = raster_surface_bytes(target);  // one row, so no stride arithmetic
+        for (int x = 0; x < 16; ++x) {
+            uint8_t combined = (uint8_t)((columns[x] * value + 127) / 255);
+            uint8_t want = 0;
+            raster_fill_row_gray(&want, 255, 1, RASTER_BLEND_NORMAL, 255, &combined);
+            uint8_t got = tp[x];
+            ++checks;
+            if (got != want) {
+                char buf[170];
+                snprintf(buf, sizeof buf,
+                         "mask %u at x=%d: got %u want %u (column coverage %u)",
+                         value, x, got, want, columns[x]);
+                fail("an antialiased edge through a mask multiplies both coverages", buf);
+                break;
+            }
+        }
+        raster_context_destroy(ctx);
+        raster_surface_release(target);
+        raster_surface_release(mask);
+    }
+}
+
+// Nesting where the inner rectangle sits somewhere else. The parent's plane is positioned at
+// the parent region's bounds, so reading it for the narrower child needs both offsets; with
+// equal-sized rectangles both are zero and a missing one is invisible.
+static void test_nested_masks_at_an_offset(void) {
+    raster_surface *outer = raster_surface_create(16, 16, RASTER_GRAY8);
+    uint8_t *op = raster_surface_mutable_bytes(outer);
+    size_t ostride = raster_surface_stride(outer);
+    for (size_t y = 0; y < 16; ++y)
+        for (size_t x = 0; x < 16; ++x)
+            op[y * ostride + x] = (uint8_t)(17 + x * 13 + y * 3);
+
+    raster_surface *inner = raster_surface_create(8, 9, RASTER_GRAY8);
+    uint8_t *inp = raster_surface_mutable_bytes(inner);
+    size_t instride = raster_surface_stride(inner);
+    for (size_t y = 0; y < 9; ++y)
+        for (size_t x = 0; x < 8; ++x)
+            inp[y * instride + x] = (uint8_t)(200 - x * 11 - y * 7);
+
+    raster_surface *target = raster_surface_create(16, 16, RASTER_GRAY8);
+    raster_context *ctx = raster_context_create(target);
+    install_identity(ctx);
+    raster_context_set_interpolation(ctx, RASTER_INTERPOLATION_NONE);
+    raster_context_set_antialias(ctx, false);
+    static const double white[4] = { 1, 1, 1, 1 };
+    raster_context_set_fill_color(ctx, white);
+
+    raster_frect innerRect = { 5, 3, 8, 9 };
+    raster_context_clip_mask(ctx, outer, (raster_frect){ 0, 0, 16, 16 });
+    raster_context_clip_mask(ctx, inner, innerRect);
+    raster_context_fill_rect(ctx, (raster_frect){ 0, 0, 16, 16 });
+
+    const uint8_t *tp = raster_surface_bytes(target);
+    size_t tstride = raster_surface_stride(target);
+    for (int y = 0; y < 16; ++y)
+        for (int x = 0; x < 16; ++x) {
+            bool in = x >= 5 && x < 13 && y >= 3 && y < 12;
+            uint8_t want = 0;
+            if (in) {
+                // Both masks are 1:1 over their own rectangles and both are placed bottom-up.
+                uint8_t a = op[(size_t)(15 - y) * ostride + (size_t)x];
+                uint8_t b = inp[(size_t)(11 - y) * instride + (size_t)(x - 5)];
+                want = (uint8_t)((a * b + 127) / 255);
+            }
+            uint8_t got = tp[(size_t)y * tstride + (size_t)x];
+            ++checks;
+            if (got != want) {
+                char buf[150];
+                snprintf(buf, sizeof buf, "at (%d,%d): got %u want %u", x, y, got, want);
+                fail("a nested mask clip reads the parent plane at the right offset", buf);
+                y = 16;
+                break;
+            }
+        }
+    raster_context_destroy(ctx);
+    raster_surface_release(target);
+    raster_surface_release(inner);
+    raster_surface_release(outer);
+}
+
+// The mask is resampled at the state's interpolation quality. FolderMaskClip sets it from the
+// layer's sampling mode immediately before clipping, so a clip that ignored it would quietly
+// give every folder mask nearest-neighbour edges.
+static void test_mask_clip_honours_interpolation(void) {
+    uint8_t results[2][8];
+    static const raster_interpolation qualities[2] = {
+        RASTER_INTERPOLATION_NONE, RASTER_INTERPOLATION_HIGH,
+    };
+    for (int q = 0; q < 2; ++q) {
+        raster_surface *mask = raster_surface_create(2, 1, RASTER_GRAY8);
+        uint8_t *mp = raster_surface_mutable_bytes(mask);
+        mp[0] = 0; mp[1] = 240;
+
+        raster_surface *target = raster_surface_create(8, 1, RASTER_GRAY8);
+        raster_context *ctx = raster_context_create(target);
+        install_identity(ctx);
+        raster_context_set_antialias(ctx, false);
+        raster_context_set_interpolation(ctx, qualities[q]);
+        static const double white[4] = { 1, 1, 1, 1 };
+        raster_context_set_fill_color(ctx, white);
+        raster_context_clip_mask(ctx, mask, (raster_frect){ 0, 0, 8, 1 });
+        raster_context_fill_rect(ctx, (raster_frect){ 0, 0, 8, 1 });
+
+        const uint8_t *tp = raster_surface_bytes(target);
+        for (int x = 0; x < 8; ++x) results[q][x] = tp[x];
+        raster_context_destroy(ctx);
+        raster_surface_release(target);
+        raster_surface_release(mask);
+    }
+
+    // Nearest gives two flat blocks and nothing else.
+    for (int x = 0; x < 8; ++x) {
+        uint8_t want = x < 4 ? 0 : 240;
+        char buf[120];
+        snprintf(buf, sizeof buf, "at x=%d: got %u want %u", x, results[0][x], want);
+        CHECK(results[0][x] == want, "nearest resamples a mask in flat blocks", buf);
+    }
+    // The smooth kernel must actually interpolate: somewhere across the step there has to be
+    // a value that is neither endpoint, which a nearest-neighbour fallback can never produce.
+    bool intermediate = false;
+    for (int x = 0; x < 8; ++x)
+        if (results[1][x] != 0 && results[1][x] != 240) intermediate = true;
+    CHECK(intermediate, "a smooth quality resamples a mask smoothly", NULL);
+}
+
+// Against a per-pixel reference, over random masks, alphas and blend modes. The engine walks
+// bands, strides and row pointers; the reference walks pixels and knows none of that.
+static void test_mask_clip_against_reference(void) {
+    static const raster_blend modes[] = {
+        RASTER_BLEND_NORMAL, RASTER_BLEND_MULTIPLY, RASTER_BLEND_SCREEN, RASTER_BLEND_COPY,
+    };
+    for (unsigned seed = 1; seed <= 600; ++seed) {
+        rngState = seed * 2246822519u + 7;
+
+        raster_surface *mask = raster_surface_create(CW, CH, RASTER_GRAY8);
+        uint8_t *mp = raster_surface_mutable_bytes(mask);
+        size_t mstride = raster_surface_stride(mask);
+        for (int y = 0; y < CH; ++y)
+            for (int x = 0; x < CW; ++x)
+                mp[(size_t)y * mstride + (size_t)x] = (uint8_t)(next_random() % 256);
+
+        raster_surface *target = raster_surface_create(CW, CH, RASTER_GRAY8);
+        uint8_t *tp = raster_surface_mutable_bytes(target);
+        size_t tstride = raster_surface_stride(target);
+        uint8_t reference[CH][CW];
+        for (int y = 0; y < CH; ++y)
+            for (int x = 0; x < CW; ++x)
+                reference[y][x] = tp[(size_t)y * tstride + (size_t)x] = (uint8_t)(next_random() % 256);
+
+        raster_blend blend = modes[next_random() % (sizeof modes / sizeof modes[0])];
+        double alpha = (double)(next_random() % 5) / 4.0;
+        double grey = (double)(next_random() % 256) / 255.0;
+
+        raster_context *ctx = raster_context_create(target);
+        install_identity(ctx);
+        raster_context_set_antialias(ctx, false);
+        raster_context_set_interpolation(ctx, RASTER_INTERPOLATION_NONE);
+        raster_context_set_blend(ctx, blend);
+        raster_context_set_alpha(ctx, alpha);
+        double fill[4] = { grey, grey, grey, 1 };
+        raster_context_set_fill_color(ctx, fill);
+        raster_frect all = { 0, 0, CW, CH };
+        raster_context_clip_mask(ctx, mask, all);
+        raster_context_fill_rect(ctx, all);
+
+        uint8_t source = (uint8_t)(grey * 255.0 + 0.5);
+        uint8_t alpha8 = alpha <= 0 ? 0 : (alpha >= 1 ? 255 : (uint8_t)(alpha * 255.0 + 0.5));
+        bool ok = true;
+        for (int y = 0; y < CH && ok; ++y)
+            for (int x = 0; x < CW; ++x) {
+                // Bottom-up, for the placement reason spelled out above.
+                uint8_t coverage = mp[(size_t)(CH - 1 - y) * mstride + (size_t)x];
+                uint8_t want = reference[y][x];
+                // One pixel at a time, exactly as the fill reference in stage 2 does: blend.c
+                // is verified on its own, so what this isolates is the band walk and the
+                // coverage lookup, not the arithmetic inside a row.
+                raster_fill_row_gray(&want, source, 1, blend, alpha8, &coverage);
+                uint8_t got = tp[(size_t)y * tstride + (size_t)x];
+                ++checks;
+                if (got != want) {
+                    char buf[190];
+                    snprintf(buf, sizeof buf,
+                             "seed %u at (%d,%d): got %u want %u (mask %u, alpha %u, blend %u)",
+                             seed, x, y, got, want, coverage, alpha8, blend);
+                    fail("a mask clip must composite as a per-pixel coverage", buf);
+                    ok = false;
+                    break;
+                }
+            }
+
+        raster_context_destroy(ctx);
+        raster_surface_release(target);
+        raster_surface_release(mask);
+    }
+}
+
 int main(void) {
     test_pixel_edge_definition();
     test_partition();
@@ -1749,6 +2330,20 @@ int main(void) {
     test_high_is_not_bilinear();
     test_premultiplied_stays_valid();
     test_draw_respects_state();
+
+    test_mask_idiom_reproduces_the_mask();
+    test_one_by_one_mask_stretches();
+    test_nested_masks_multiply();
+    test_mask_clip_restores();
+    test_plane_rebases_after_a_rect_clip();
+    test_mask_clip_applies_to_image_draws();
+    test_mask_clip_refusals();
+    test_mask_clip_bounds_ignore_the_mask();
+    test_mask_rect_clips_hard();
+    test_antialiased_fill_through_a_mask();
+    test_nested_masks_at_an_offset();
+    test_mask_clip_honours_interpolation();
+    test_mask_clip_against_reference();
 
     fprintf(stderr, "%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
