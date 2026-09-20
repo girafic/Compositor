@@ -61,14 +61,37 @@ struct SurfaceCropTests {
         #expect(raster_surface_bytes(view)?[1 * 8 + 1] == 77)
     }
 
-    @Test("an empty or out-of-bounds crop returns nothing")
-    func outOfBounds() throws {
-        // CGImage.cropping(to:) returns nil for exactly these, and five call sites branch on it.
+    @Test("an overhanging crop is trimmed rather than refused")
+    func overhangIsTrimmed() throws {
+        // CGImageCreateWithImageInRect intersects with the image; it does not refuse. The
+        // difference is not cosmetic: RasterSnapshot drops the whole piece when a crop comes
+        // back nil, so refusing an overhang would silently lose painted pixels.
         let surface = try #require(raster_surface_create(8, 8, Format.gray8))
         defer { raster_surface_release(surface) }
-        #expect(raster_surface_crop(surface, 4, 4, 8, 8) == nil)
+        try #require(raster_surface_mutable_bytes(surface))[2 * 8 + 6] = 99
+
+        let both = try #require(raster_surface_crop(surface, 4, 4, 8, 8))
+        defer { raster_surface_release(both) }
+        #expect(raster_surface_width(both) == 4 && raster_surface_height(both) == 4)
+
+        // Trimming must move the window's size, never its origin: the view still starts at
+        // the pixel asked for.
+        let oneAxis = try #require(raster_surface_crop(surface, 6, 2, 10, 2))
+        defer { raster_surface_release(oneAxis) }
+        #expect(raster_surface_width(oneAxis) == 2 && raster_surface_height(oneAxis) == 2)
+        #expect(raster_surface_bytes(oneAxis)?[0] == 99)
+    }
+
+    @Test("an empty crop, or one that misses the surface, returns nothing")
+    func outOfBounds() throws {
+        // nil means empty intersection and nothing else. Thirteen call sites branch on it.
+        let surface = try #require(raster_surface_create(8, 8, Format.gray8))
+        defer { raster_surface_release(surface) }
         #expect(raster_surface_crop(surface, 0, 0, 0, 4) == nil)
+        #expect(raster_surface_crop(surface, 0, 0, 4, 0) == nil)
         #expect(raster_surface_crop(surface, 9, 0, 1, 1) == nil)
+        #expect(raster_surface_crop(surface, 0, 9, 1, 1) == nil)
+        #expect(raster_surface_crop(surface, 8, 0, 1, 1) == nil, "x == width is already past it")
 
         let edge = try #require(raster_surface_crop(surface, 4, 4, 4, 4), "flush to the edge is valid")
         raster_surface_release(edge)

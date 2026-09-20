@@ -61,12 +61,38 @@ jobs:
           ! grep -q 'warning:' build.log
 
       - name: Test
-        run: swift test -c debug
+        shell: bash
+        run: |
+          set -o pipefail
+          swift test -c debug 2>&1 | tee test-debug.log
 
       # The kernels are hand-written pointer code. Optimised builds are where aliasing and
       # out-of-bounds assumptions actually bite, so release is not optional here.
       - name: Build and test (release)
-        run: swift build -c release && swift test -c release
+        shell: bash
+        run: |
+          set -o pipefail
+          swift build -c release
+          swift test -c release 2>&1 | tee test-release.log
+
+      # swift-testing runs each test target as its own process and prints one summary per
+      # target, so a run's totals and its failures are scattered through thousands of lines of
+      # per-test chatter. Pulling just those lines out, last, puts them where a log tail can
+      # reach them -- which is the only way this port's author can read them at all, since the
+      # full log archive lives behind a host this environment cannot fetch.
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          for log in test-debug.log test-release.log; do
+            [ -f "$log" ] || { echo "== $log: not produced =="; continue; }
+            echo "== $log =="
+            # Alternation rather than a bracket expression: the container has no UTF-8 locale
+            # set, so grep compares bytes and a bracket class over multi-byte glyphs would
+            # match their individual bytes anywhere.
+            grep -E '✘|error:|Note: Some test targets|Test run with' "$log" \
+              || echo "  nothing matched -- the run produced no summary at all"
+          done
 
   # Answers the two questions Milestone 2's design rests on: what geometry Foundation already vends
   # on Linux, and whether a SwiftPM target may be called CoreGraphics. Reports rather than gates --
