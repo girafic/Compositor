@@ -111,11 +111,12 @@ untested one; the two results that matter are quoted above.
 
 ## `context-oracle.c` — does the drawing context agree with a brute-force model?
 
-**Answered: yes. 1,065,645 checks, 0 failures**, on two compilers and five optimisation
+**Answered: yes. 1,082,387 checks, 0 failures**, on two compilers and five optimisation
 levels, clean under valgrind and under gcc's AddressSanitizer + UndefinedBehaviorSanitizer.
 
-Covers `coverage.c` (the device-pixel arithmetic) and `context.c` (the graphics state stack,
-the clip stack, snapshots, fill and clear) against independent models:
+Covers `coverage.c` (the device-pixel arithmetic), `context.c` (the graphics state stack,
+the clip stack, snapshots, fill and clear) and `draw_image.c` (the sampler) against
+independent models:
 
 - **The edge rule** against a direct centre test, over random rectilinear matrices from both
   families, with negative scales and negative device origins. The input space is seeded with
@@ -130,6 +131,25 @@ the clip stack, snapshots, fill and clear) against independent models:
 - **Copy-on-write**, including the case where the snapshot was released before the draw (it
   must cost a refcount decrement, not a canvas copy) and the borrowed target (which can never
   detach, so its snapshot is copied eagerly).
+
+The sampler adds a third stage, against the promises the app's own tests encode:
+
+- **1:1 is exact** across all five interpolation qualities, with antialiasing on and off, on
+  both pixel formats, at integer and at shifted-integer origins. This is the single hardest
+  requirement in the slice: `RasterSnapshotTests` memcmps a `.high` render against a `.low`
+  one over 64 MB, and those two paths differ in quality, antialiasing, geometry *and* the
+  float expression used for the destination edge. Byte equality is only reachable if 1:1
+  neutralises all four.
+- **The nearest tie-break** on a ramp at 1:1, 2x and 0.5x. Both plausible wrong answers must
+  fail, and 0.5x is what separates them: corner-to-corner mapping agrees with the correct
+  rule at 1:1 and under magnification, and only diverges under reduction.
+- **The sampler against a reference** that computes each destination pixel's source
+  coordinate in closed form, so nothing it does can drift the way an incremental walk would.
+- **Crop invariance**: one image drawn whole, then in strips with margin, compared byte for
+  byte. Exact, not within a tolerance — the closed-form calculation gives that for free, and
+  the app only asks for 2.
+- **Reduction without aliasing**, edge replication on both sides, Catmull-Rom actually
+  differing from the tent kernel, and premultiplied validity (no colour above its own alpha).
 
 ```sh
 clang -std=gnu11 -Wall -Wextra -Werror -O1 -ISources/CCompositorRaster/include \
@@ -164,6 +184,27 @@ are the interesting ones:
 - Copying a snapshot eagerly is always *correct*, just slower, so nothing noticed a
   full-canvas memcpy per `makeImage`. Fixed by asserting that a fresh snapshot shares the
   context's pixel pointer.
+
+17 more defects were injected with the sampler, into `draw_image.c`, `context.c` and
+`surface.c`: rounding instead of flooring the source index, corner-to-corner mapping, a
+kernel that never widens with the reduction factor, a tent that is really a box, unnormalised
+weights, edge clamping that wraps instead, Catmull-Rom silently replaced by the tent, a
+truncated rather than rounded output byte, a lost y flip, a draw that ignores the clip, the
+alpha, the rectilinear check, the format check or the snapshot detach, a crop that refuses
+an overhang again, and two forms of a missing premultiplied clamp. **All 17 were caught**,
+one only after the test was improved:
+
+- **Clamping only the red channel survived.** The validity test drove a single red spike
+  through Catmull-Rom's negative lobes, so a clamp that looked at channel 0 and stopped was
+  indistinguishable from a correct one. The image now spikes each of red, green and blue at
+  a different distance from the alpha hole, which also catches a clamp that decides once and
+  applies that answer to all three.
+
+One mutant in that sweep is worth recording as a method note rather than a result: deleting
+the clamp's loop body left `if (format == RASTER_RGBA8)` with no statement, so it failed to
+compile. A mutant that does not build is not a surviving mutant and not a killed one — it is
+a malformed experiment, and reading it as either would be wrong. It was rewritten to remove
+the whole guard, and in that form it dies.
 
 ## `probe-linux-swift.sh` — what does the Linux toolchain actually vend?
 

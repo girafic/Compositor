@@ -1566,11 +1566,19 @@ static void test_premultiplied_stays_valid(void) {
     raster_surface *image = raster_surface_create(4, 1, RASTER_RGBA8);
     uint8_t *ip = raster_surface_mutable_bytes(image);
     const uint8_t alpha[4] = { 255, 255, 0, 255 };
-    const uint8_t red[4] = { 0, 255, 0, 0 };  // valid premultiplied: red <= alpha everywhere
+
+    // Every channel gets its own spike, at its own distance from the hole at index 2. A single
+    // red spike would let a clamp that only ever looks at channel 0 pass: mutation testing
+    // found exactly that. Different patterns per channel also catch a clamp that decides once
+    // and applies the same answer to all three. Each row is valid premultiplied input --
+    // colour never exceeds alpha -- so any violation downstream is the resampler's doing.
+    const uint8_t colour[3][4] = {
+        { 0, 255, 0, 0 },    // red:   adjacent to the hole from the left
+        { 0, 0, 0, 255 },    // green: adjacent from the right
+        { 255, 0, 0, 0 },    // blue:  two pixels away, so its lobe reaches further
+    };
     for (int i = 0; i < 4; ++i) {
-        ip[i * 4 + 0] = red[i];
-        ip[i * 4 + 1] = 0;
-        ip[i * 4 + 2] = 0;
+        for (int c = 0; c < 3; ++c) ip[i * 4 + c] = colour[c][i];
         ip[i * 4 + 3] = alpha[i];
     }
 
@@ -1582,14 +1590,17 @@ static void test_premultiplied_stays_valid(void) {
     raster_context_draw_image(ctx, image, (raster_frect){ 0, 0, 16, 1 });
 
     const uint8_t *p = raster_surface_bytes(target);
+    static const char *const names[3] = { "red", "green", "blue" };
     for (int x = 0; x < 16; ++x) {
-        ++checks;
-        if (p[x * 4] > p[x * 4 + 3]) {
-            char buf[160];
-            snprintf(buf, sizeof buf, "pixel %d has red %u above alpha %u",
-                     x, p[x * 4], p[x * 4 + 3]);
-            fail("a resampled colour must not exceed its own alpha", buf);
-            break;
+        for (int c = 0; c < 3; ++c) {
+            ++checks;
+            if (p[x * 4 + c] > p[x * 4 + 3]) {
+                char buf[160];
+                snprintf(buf, sizeof buf, "pixel %d has %s %u above alpha %u",
+                         x, names[c], p[x * 4 + c], p[x * 4 + 3]);
+                fail("a resampled colour must not exceed its own alpha", buf);
+                break;
+            }
         }
     }
     raster_context_destroy(ctx);
