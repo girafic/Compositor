@@ -2012,6 +2012,32 @@ static void test_mask_clip_refusals(void) {
     CHECK(raster_context_clip_mask(ctx, gray, all) == RASTER_OK,
           "a quarter turn is rectilinear and is accepted", NULL);
 
+    // Degenerate rectangles are requests, not errors: they clip everything away, exactly as
+    // clip_rect defines it. The image mapping refuses a zero extent, so this passes only if
+    // the emptiness is settled before the mapping is asked for -- which it was not at first,
+    // and a million checks here did not notice until the Swift binding test did.
+    static const raster_frect degenerate[] = {
+        { 0, 0, 0, 8 }, { 0, 0, 8, 0 }, { 0, 0, 0, 0 },
+        // Non-zero but too thin to contain a pixel centre, which reaches the same place by
+        // the centre rule rather than by the zero test.
+        { 2.1, 0, 0.3, 8 },
+    };
+    for (size_t i = 0; i < sizeof degenerate / sizeof degenerate[0]; ++i) {
+        raster_surface *fresh = raster_surface_create(8, 8, RASTER_GRAY8);
+        raster_context *empty = raster_context_create(fresh);
+        install_identity(empty);
+        char buf[90];
+        snprintf(buf, sizeof buf, "rect %g,%g %gx%g", degenerate[i].x, degenerate[i].y,
+                 degenerate[i].width, degenerate[i].height);
+        CHECK(raster_context_clip_mask(empty, gray, degenerate[i]) == RASTER_OK,
+              "an empty mask rectangle is accepted, not refused", buf);
+        raster_rect bounds;
+        CHECK(!raster_context_clip_bounds(empty, &bounds),
+              "and it leaves the clip empty", buf);
+        raster_context_destroy(empty);
+        raster_surface_release(fresh);
+    }
+
     raster_context_destroy(ctx);
     raster_surface_release(target);
     raster_surface_release(colour);

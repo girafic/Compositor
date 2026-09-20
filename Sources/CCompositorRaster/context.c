@@ -336,18 +336,23 @@ raster_status raster_context_clip_mask(raster_context *ctx, const raster_surface
     if (!raster_matrix_is_rectilinear(ctx->state.ctm, rect, &canonical))
         return RASTER_UNSUPPORTED_TRANSFORM;
 
-    raster_matrix deviceToMask;
-    if (!raster_image_mapping(canonical, rect, raster_surface_width(mask),
-                              raster_surface_height(mask), &deviceToMask))
-        return RASTER_UNSUPPORTED_TRANSFORM;
-
     // The rectangle clips hard, by the same centre rule as every other clip. Softness comes
     // from the mask's own values and from nowhere else.
+    //
+    // This has to come *before* the mapping. An empty rectangle is a legitimate way to clip
+    // everything away -- Selection builds one for an empty marquee, and clip_rect already
+    // defines it that way -- but raster_image_mapping refuses a degenerate rectangle, and
+    // treating that refusal as an unsupported transform turns a valid request into a trap.
     raster_rect device;
     if (!raster_device_rect_covered(canonical, rect, &device)) {
         raster_region *nothing = raster_region_create();
         return clip_intersect(ctx, nothing);
     }
+
+    raster_matrix deviceToMask;
+    if (!raster_image_mapping(canonical, rect, raster_surface_width(mask),
+                              raster_surface_height(mask), &deviceToMask))
+        return RASTER_UNSUPPORTED_TRANSFORM;
 
     raster_region *piece = raster_region_create_rect(device);
     if (!piece) return RASTER_OUT_OF_MEMORY;
