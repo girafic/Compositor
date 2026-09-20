@@ -109,6 +109,62 @@ The seven survivors are all genuinely undetectable rather than untested:
 Four further mutants removed whole guard pairs at once, to tell a redundant guard from an
 untested one; the two results that matter are quoted above.
 
+## `context-oracle.c` — does the drawing context agree with a brute-force model?
+
+**Answered: yes. 1,065,645 checks, 0 failures**, on two compilers and five optimisation
+levels, clean under valgrind and under gcc's AddressSanitizer + UndefinedBehaviorSanitizer.
+
+Covers `coverage.c` (the device-pixel arithmetic) and `context.c` (the graphics state stack,
+the clip stack, snapshots, fill and clear) against independent models:
+
+- **The edge rule** against a direct centre test, over random rectilinear matrices from both
+  families, with negative scales and negative device origins. The input space is seeded with
+  exact integers, exact half-integers, and values one ulp either side of a half-integer,
+  because uniform random doubles would essentially never reach the cases that can break it.
+- **The partition property** — splitting a range at any real point gives two ranges that tile
+  it exactly. This is "piecewise == whole" reduced to integers and checked exhaustively.
+- **The clip stack** against a `bool[20][14]` stack, reusing `region-oracle.c`'s oracle.
+- **Every fill** against a reference that loops over each pixel and calls `raster_blend_*`
+  one at a time. Nothing in that reference knows about bands, strides or row pointers, which
+  is exactly where the engine's bugs would be.
+- **Copy-on-write**, including the case where the snapshot was released before the draw (it
+  must cost a refcount decrement, not a canvas copy) and the borrowed target (which can never
+  detach, so its snapshot is copied eagerly).
+
+```sh
+clang -std=gnu11 -Wall -Wextra -Werror -O1 -ISources/CCompositorRaster/include \
+  Spikes/context-oracle.c Sources/CCompositorRaster/*.c -lm -o /tmp/context-oracle
+valgrind --error-exitcode=99 --leak-check=full --errors-for-leak-kinds=all /tmp/context-oracle
+
+gcc -std=gnu11 -Wall -Wextra -Werror -O2 -fsanitize=address,undefined \
+  -fno-sanitize-recover=all -ISources/CCompositorRaster/include \
+  Spikes/context-oracle.c Sources/CCompositorRaster/*.c -lm -o /tmp/context-asan && /tmp/context-asan
+```
+
+### What it caught, and what mutation testing then caught
+
+The oracle found a real defect on its first run, before any of this reached Swift:
+`ceil(t - 0.5)` loses its last bit when `t` is within an ulp of a half-integer, and `ceil`
+then lands a column out. `raster_pixel_edge` now corrects the seed against the definition
+directly, which also makes the tie-break impossible to drift — any seed within one converges
+to the same answer, so replacing `ceil(t - 0.5)` with `round(t)` changes nothing.
+
+33 defects were then injected deliberately, 14 into `coverage.c` and 19 into `context.c`.
+**All 33 were caught**, but four of them only after the tests were improved, and those four
+are the interesting ones:
+
+- Two tie-break mutants survived because the correction step *is* the specification. That is
+  an equivalent-mutant result rather than a gap, and it is stronger than the design intended.
+- "Truncate instead of round" in the coverage ramp slipped under a sum-based tolerance, since
+  the two differ by at most one part in 255 per partial pixel. Fixed by asserting exact
+  coverage bytes for intervals in eighths — not tenths, because 0.1 is not representable and
+  an "exact" expectation written with it tests the author's arithmetic rather than the code's.
+- A missing `clip_release` in `restoreGState` is a leak, not a wrong answer, so no behavioural
+  oracle could see it. Valgrind does: 242 KB definitely lost, exit 99.
+- Copying a snapshot eagerly is always *correct*, just slower, so nothing noticed a
+  full-canvas memcpy per `makeImage`. Fixed by asserting that a fresh snapshot shares the
+  context's pixel pointer.
+
 ## `probe-linux-swift.sh` — what does the Linux toolchain actually vend?
 
 **Answered on Swift 6.4.0 / Ubuntu 24.04: 12 passed, 8 failed — and the failures are the useful
