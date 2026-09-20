@@ -1100,6 +1100,618 @@ static void test_piecewise_equals_whole(void) {
     }
 }
 
+// MARK: - Stage 3: the image sampler
+
+// A context created with raster_context_create has CoreGraphics' own user space: origin at
+// the bottom left, y up. Drawing an image into (0, 0, w, h) there lands row 0 on device row
+// 0, so that is the natural 1:1 case and what these tests use. The app's own contexts flip
+// once at construction and BrushRaster.draw flips again, which comes to the same thing.
+
+static raster_surface *ramp_image(int w, int h, raster_format format, unsigned seed) {
+    raster_surface *image = raster_surface_create((size_t)w, (size_t)h, format);
+    uint8_t *p = raster_surface_mutable_bytes(image);
+    size_t stride = raster_surface_stride(image);
+    size_t bpp = raster_bytes_per_pixel(format);
+    rngState = seed;
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            uint8_t *q = p + (size_t)y * stride + (size_t)x * bpp;
+            if (format == RASTER_GRAY8) {
+                q[0] = (uint8_t)((x * 7 + y * 13 + (int)(next_random() % 5)) & 0xFF);
+            } else {
+                uint8_t a = (uint8_t)(128 + (next_random() % 128));
+                q[3] = a;
+                for (int c = 0; c < 3; ++c)
+                    q[c] = (uint8_t)(((x * (c + 3) + y * (c + 5)) % 256) * a / 255);
+            }
+        }
+    return image;
+}
+
+// The device -> source mapping, written independently of draw_image.c for the default CTM.
+static void reference_source(int X, int Y, double contextHeight, raster_frect rect,
+                             int W, int H, double *u, double *v) {
+    double xUser = (double)X + 0.5;
+    double yUser = contextHeight - ((double)Y + 0.5);
+    *u = (xUser - rect.x) * (double)W / rect.width;
+    *v = (rect.y + rect.height - yUser) * (double)H / rect.height;
+}
+
+static void test_one_to_one_is_exact(void) {
+    static const raster_interpolation qualities[] = {
+        RASTER_INTERPOLATION_NONE, RASTER_INTERPOLATION_DEFAULT, RASTER_INTERPOLATION_LOW,
+        RASTER_INTERPOLATION_MEDIUM, RASTER_INTERPOLATION_HIGH,
+    };
+    const raster_format formats[] = { RASTER_RGBA8, RASTER_GRAY8 };
+
+    for (int f = 0; f < 2; ++f) {
+        raster_format format = formats[f];
+        size_t bpp = raster_bytes_per_pixel(format);
+        for (int shifted = 0; shifted < 2; ++shifted) {
+            int ox = shifted ? 3 : 0, oy = shifted ? 2 : 0;
+            raster_surface *image = ramp_image(11, 7, format, 91 + (unsigned)f);
+
+            for (size_t q = 0; q < 5; ++q) {
+                for (int aa = 0; aa < 2; ++aa) {
+                    raster_surface *target = raster_surface_create(11 + 6, 7 + 6, format);
+                    raster_context *ctx = raster_context_create(target);
+                    raster_context_set_antialias(ctx, aa != 0);
+                    raster_context_set_interpolation(ctx, qualities[q]);
+                    raster_context_set_blend(ctx, RASTER_BLEND_COPY);
+
+                    // Bottom-left origin: to land the image at device row `oy` the rect's
+                    // top edge has to sit that far below the context's top.
+                    double top = (double)(7 + 6) - (double)oy;
+                    raster_frect rect = { (double)ox, top - 7.0, 11.0, 7.0 };
+                    raster_status status = raster_context_draw_image(ctx, image, rect);
+                    ++checks;
+                    if (status != RASTER_OK) {
+                        fail("draw_image failed at 1:1", NULL);
+                        raster_context_destroy(ctx); raster_surface_release(target);
+                        raster_surface_release(image);
+                        return;
+                    }
+
+                    const uint8_t *src = raster_surface_bytes(image);
+                    const uint8_t *dst = raster_surface_bytes(target);
+                    size_t sstride = raster_surface_stride(image);
+                    size_t dstride = raster_surface_stride(target);
+                    ++checks;
+                    for (int y = 0; y < 7; ++y)
+                        if (memcmp(dst + (size_t)(y + oy) * dstride + (size_t)ox * bpp,
+                                   src + (size_t)y * sstride, 11 * bpp) != 0) {
+                            char buf[200];
+                            snprintf(buf, sizeof buf,
+                                     "%s quality %zu aa %d shifted %d: row %d differs",
+                                     format == RASTER_GRAY8 ? "GRAY8" : "RGBA8", q, aa, shifted, y);
+                            fail("a 1:1 draw must be an exact selection", buf);
+                            raster_context_destroy(ctx); raster_surface_release(target);
+                            raster_surface_release(image);
+                            return;
+                        }
+                    raster_context_destroy(ctx);
+                    raster_surface_release(target);
+                }
+            }
+            raster_surface_release(image);
+        }
+    }
+}
+
+// Which source column each destination column reads, recovered by drawing a horizontal ramp
+// whose every column is a distinct value.
+static void columns_read(raster_surface *target, raster_context *ctx, raster_surface *image,
+                         raster_frect rect, int outWidth, int *out) {
+    raster_context_set_interpolation(ctx, RASTER_INTERPOLATION_NONE);
+    raster_context_set_blend(ctx, RASTER_BLEND_COPY);
+    raster_context_set_antialias(ctx, false);
+    raster_context_draw_image(ctx, image, rect);
+    const uint8_t *p = raster_surface_bytes(target);
+    for (int x = 0; x < outWidth; ++x) out[x] = p[x];  // GRAY8, row 0
+}
+
+static void test_nearest_tie_break(void) {
+    // A GRAY8 ramp where column i holds i, so the value read *is* the column index.
+    const int W = 6;
+    raster_surface *image = raster_surface_create((size_t)W, 1, RASTER_GRAY8);
+    uint8_t *ip = raster_surface_mutable_bytes(image);
+    for (int i = 0; i < W; ++i) ip[i] = (uint8_t)i;
+
+    struct { const char *name; int outWidth; double rectWidth; double rectX; int want[6]; } cases[] = {
+        // 1:1 — the case where round() applied to the same expression shifts everything.
+        { "1:1", 6, 6.0, 0.0, { 0, 1, 2, 3, 4, 5 } },
+        { "1:1 at x=3", 6, 6.0, 3.0, { 0, 1, 2, 3, 4, 5 } },
+        // 2x magnification — corner-to-corner agrees here, which is why it needs 0.5x too.
+        { "2x", 6, 12.0, 0.0, { 0, 0, 1, 1, 2, 2 } },
+        // 0.5x reduction — this is where corner-to-corner diverges: it would read 0,2,4.
+        { "0.5x", 3, 3.0, 0.0, { 1, 3, 5, 0, 0, 0 } },
+        // A non-integer origin, where corner-to-corner also diverges.
+        { "1:1 at x=2.5", 6, 6.0, 2.5, { 0, 1, 2, 3, 4, 5 } },
+    };
+
+    for (size_t k = 0; k < sizeof cases / sizeof cases[0]; ++k) {
+        int outWidth = cases[k].outWidth;
+        raster_surface *target = raster_surface_create((size_t)(outWidth + 4), 1, RASTER_GRAY8);
+        raster_context *ctx = raster_context_create(target);
+        raster_frect rect = { cases[k].rectX, 0.0, cases[k].rectWidth, 1.0 };
+        int got[6] = { 0, 0, 0, 0, 0, 0 };
+        int raw[10];
+        columns_read(target, ctx, image, rect, outWidth + 4, raw);
+        for (int x = 0; x < outWidth; ++x) got[x] = raw[x + (int)cases[k].rectX];
+
+        ++checks;
+        for (int x = 0; x < outWidth; ++x)
+            if (got[x] != cases[k].want[x]) {
+                char buf[200];
+                int n = snprintf(buf, sizeof buf, "%s: read", cases[k].name);
+                for (int j = 0; j < outWidth; ++j)
+                    n += snprintf(buf + n, sizeof buf - (size_t)n, " %d", got[j]);
+                n += snprintf(buf + n, sizeof buf - (size_t)n, ", want");
+                for (int j = 0; j < outWidth; ++j)
+                    n += snprintf(buf + n, sizeof buf - (size_t)n, " %d", cases[k].want[j]);
+                fail("nearest tie-break", buf);
+                break;
+            }
+        raster_context_destroy(ctx);
+        raster_surface_release(target);
+    }
+    raster_surface_release(image);
+}
+
+static void test_sampler_against_reference(void) {
+    for (unsigned seed = 1; seed <= 400; ++seed) {
+        rngState = seed * 2654435761u + 71;
+        raster_format format = next_random() % 2 ? RASTER_RGBA8 : RASTER_GRAY8;
+        size_t bpp = raster_bytes_per_pixel(format);
+        int iw = 3 + (int)(next_random() % 9), ih = 3 + (int)(next_random() % 7);
+        raster_surface *image = ramp_image(iw, ih, format, seed);
+
+        int cw = 18, ch = 14;
+        raster_surface *target = raster_surface_create((size_t)cw, (size_t)ch, format);
+        raster_context *ctx = raster_context_create(target);
+        raster_context_set_antialias(ctx, false);
+        raster_context_set_blend(ctx, RASTER_BLEND_COPY);
+        raster_context_set_interpolation(ctx, RASTER_INTERPOLATION_NONE);
+
+        raster_frect rect = { random_double(-2, 10), random_double(-2, 8),
+                              random_double(1, 14), random_double(1, 11) };
+        raster_context_draw_image(ctx, image, rect);
+
+        // The reference: for every device pixel the draw could have touched, compute the
+        // source coordinate independently and take the nearest sample.
+        raster_matrix identity = { 1, 0, 0, 1, 0, 0 };
+        raster_rect area;
+        if (raster_device_rect_covered(identity, (raster_frect){ rect.x, (double)ch - rect.y - rect.height,
+                                                                  rect.width, rect.height }, &area)) {
+            const uint8_t *sp = raster_surface_bytes(image);
+            const uint8_t *dp = raster_surface_bytes(target);
+            size_t sstride = raster_surface_stride(image);
+            size_t dstride = raster_surface_stride(target);
+            for (int32_t y = area.y0; y < area.y1; ++y) {
+                if (y < 0 || y >= ch) continue;
+                for (int32_t x = area.x0; x < area.x1; ++x) {
+                    if (x < 0 || x >= cw) continue;
+                    double u, v;
+                    reference_source(x, y, (double)ch, rect, iw, ih, &u, &v);
+                    int si = (int)floor(u), sj = (int)floor(v);
+                    if (si < 0) si = 0;
+                    if (si >= iw) si = iw - 1;
+                    if (sj < 0) sj = 0;
+                    if (sj >= ih) sj = ih - 1;
+                    ++checks;
+                    if (memcmp(dp + (size_t)y * dstride + (size_t)x * bpp,
+                               sp + (size_t)sj * sstride + (size_t)si * bpp, bpp) != 0) {
+                        char buf[240];
+                        snprintf(buf, sizeof buf,
+                                 "seed %u %s: device (%d,%d) -> source (%d,%d) u=%.4f v=%.4f",
+                                 seed, format == RASTER_GRAY8 ? "GRAY8" : "RGBA8",
+                                 x, y, si, sj, u, v);
+                        fail("nearest sampling disagrees with the reference", buf);
+                        raster_context_destroy(ctx); raster_surface_release(target);
+                        raster_surface_release(image);
+                        return;
+                    }
+                }
+            }
+        }
+        raster_context_destroy(ctx);
+        raster_surface_release(target);
+        raster_surface_release(image);
+    }
+}
+
+// A piece of an image drawn on its own must match the same region of the whole. This is what
+// the tiled renderer rests on, and it is why the source coordinate is computed in closed
+// form per pixel rather than accumulated.
+static void test_crop_invariance(void) {
+    static const raster_interpolation qualities[] = {
+        RASTER_INTERPOLATION_LOW, RASTER_INTERPOLATION_HIGH, RASTER_INTERPOLATION_NONE,
+    };
+    for (unsigned seed = 1; seed <= 120; ++seed) {
+        for (size_t q = 0; q < 3; ++q) {
+            rngState = seed * 40503u + 97;
+            raster_surface *image = ramp_image(23, 5, RASTER_RGBA8, seed);
+            raster_frect rect = { 1.0, 1.0, random_double(6, 30), 3.0 };
+            int cw = 36, ch = 8;
+
+            raster_surface *whole = raster_surface_create((size_t)cw, (size_t)ch, RASTER_RGBA8);
+            raster_context *wc = raster_context_create(whole);
+            raster_context_set_antialias(wc, false);
+            raster_context_set_blend(wc, RASTER_BLEND_COPY);
+            raster_context_set_interpolation(wc, qualities[q]);
+            raster_context_draw_image(wc, image, rect);
+
+            raster_surface *pieces = raster_surface_create((size_t)cw, (size_t)ch, RASTER_RGBA8);
+            raster_context *pc = raster_context_create(pieces);
+            raster_context_set_antialias(pc, false);
+            raster_context_set_blend(pc, RASTER_BLEND_COPY);
+            raster_context_set_interpolation(pc, qualities[q]);
+            // Same draw, but each strip clipped to a slice. The clip changes; the geometry
+            // handed to the sampler does not.
+            for (int s = 0; s < 4; ++s) {
+                raster_context_save(pc);
+                raster_context_clip_rect(pc, (raster_frect){ (double)(s * 9), -10, 9, 30 });
+                raster_context_draw_image(pc, image, rect);
+                raster_context_restore(pc);
+            }
+
+            ++checks;
+            const uint8_t *a = raster_surface_bytes(whole), *b = raster_surface_bytes(pieces);
+            size_t astride = raster_surface_stride(whole), bstride = raster_surface_stride(pieces);
+            for (int y = 0; y < ch; ++y)
+                if (memcmp(a + (size_t)y * astride, b + (size_t)y * bstride, (size_t)cw * 4) != 0) {
+                    char buf[160];
+                    snprintf(buf, sizeof buf, "seed %u quality %zu: row %d differs", seed, q, y);
+                    fail("a clipped piece differs from the whole draw", buf);
+                    raster_context_destroy(wc); raster_context_destroy(pc);
+                    raster_surface_release(whole); raster_surface_release(pieces);
+                    raster_surface_release(image);
+                    return;
+                }
+            raster_context_destroy(wc);
+            raster_context_destroy(pc);
+            raster_surface_release(whole);
+            raster_surface_release(pieces);
+            raster_surface_release(image);
+        }
+    }
+}
+
+// The reduction a single draw receives is not bounded by 2: the halving chain saturates at
+// level 6, so a very large image landing small arrives here several times over, and the
+// brush's stamp fallback can be far worse. A fixed two-tap filter collapses one-pixel
+// stripes to a single value there, which is what this measures.
+//
+// The outermost pixels are excluded, because edge replication legitimately pulls them toward
+// whichever border value they sit against — DownsampleTests.swift:58 excludes its own edges
+// for the same reason ("The outermost pixels fade into the transparent edge; judge the
+// inside").
+static void test_reduction_does_not_alias(void) {
+    struct { int source, target; const char *name; bool integerRatio; } sizes[] = {
+        { 64, 8, "8x", true }, { 64, 16, "4x", true }, { 60, 7, "8.6x, non-integer", false },
+    };
+    struct { raster_interpolation quality; const char *name; } averaging[] = {
+        { RASTER_INTERPOLATION_LOW, "low" },
+        { RASTER_INTERPOLATION_DEFAULT, "default" },
+        { RASTER_INTERPOLATION_HIGH, "high" },
+        { RASTER_INTERPOLATION_MEDIUM, "medium" },
+    };
+
+    for (size_t s = 0; s < 3; ++s) {
+        int W = sizes[s].source, outW = sizes[s].target;
+        raster_surface *image = raster_surface_create((size_t)W, 1, RASTER_GRAY8);
+        uint8_t *ip = raster_surface_mutable_bytes(image);
+        for (int i = 0; i < W; ++i) ip[i] = (uint8_t)(i % 2 ? 255 : 0);
+
+        for (size_t k = 0; k < 4; ++k) {
+            raster_surface *target = raster_surface_create((size_t)outW, 1, RASTER_GRAY8);
+            raster_context *ctx = raster_context_create(target);
+            raster_context_set_antialias(ctx, false);
+            raster_context_set_blend(ctx, RASTER_BLEND_COPY);
+            raster_context_set_interpolation(ctx, averaging[k].quality);
+            raster_context_draw_image(ctx, image, (raster_frect){ 0, 0, (double)outW, 1 });
+
+            const uint8_t *p = raster_surface_bytes(target);
+            int lo = 255, hi = 0;
+            double mean = 0;
+            int n = 0;
+            for (int x = 2; x < outW - 2; ++x) {
+                if (p[x] < lo) lo = p[x];
+                if (p[x] > hi) hi = p[x];
+                mean += p[x];
+                ++n;
+            }
+            ++checks;
+            if (n > 0 && (hi - lo > 2 || fabs(mean / n - 127.5) > 2.0)) {
+                char buf[200];
+                snprintf(buf, sizeof buf, "%s at %s: interior %d..%d, mean %.1f",
+                         averaging[k].name, sizes[s].name, lo, hi, mean / n);
+                fail("a reduction must average one-pixel stripes to flat grey", buf);
+            }
+            // Exactly 128, not 127: an even split of 0 and 255 is 127.5, and the samples are
+            // rounded rather than truncated on the way back to a byte.
+            if (sizes[s].integerRatio && n > 0) {
+                ++checks;
+                if (lo != 128 || hi != 128) {
+                    char buf[200];
+                    snprintf(buf, sizeof buf, "%s at %s: interior %d..%d, want exactly 128",
+                             averaging[k].name, sizes[s].name, lo, hi);
+                    fail("the sample must be rounded, not truncated", buf);
+                }
+            }
+            raster_context_destroy(ctx);
+            raster_surface_release(target);
+        }
+
+        // The control, which proves the measurement is sensitive: at an integer ratio
+        // nearest neighbour lands on the same parity every time and loses the stripes
+        // entirely. At a non-integer ratio the sample point drifts across parities, so
+        // nearest averages by accident and makes no control at all.
+        if (!sizes[s].integerRatio) {
+            raster_surface_release(image);
+            continue;
+        }
+        raster_surface *target = raster_surface_create((size_t)outW, 1, RASTER_GRAY8);
+        raster_context *ctx = raster_context_create(target);
+        raster_context_set_antialias(ctx, false);
+        raster_context_set_blend(ctx, RASTER_BLEND_COPY);
+        raster_context_set_interpolation(ctx, RASTER_INTERPOLATION_NONE);
+        raster_context_draw_image(ctx, image, (raster_frect){ 0, 0, (double)outW, 1 });
+        const uint8_t *p = raster_surface_bytes(target);
+        double mean = 0;
+        for (int x = 0; x < outW; ++x) mean += p[x];
+        ++checks;
+        if (fabs(mean / outW - 127.5) < 40.0) {
+            char buf[160];
+            snprintf(buf, sizeof buf, "nearest at %s averaged to %.1f; it should not",
+                     sizes[s].name, mean / outW);
+            fail("the aliasing measurement is not sensitive", buf);
+        }
+        raster_context_destroy(ctx);
+        raster_surface_release(target);
+        raster_surface_release(image);
+    }
+}
+
+// Samples that fall outside the image replicate its edge. Getting this wrong is invisible in
+// the interior and only shows at the border, so it needs its own test: a two-pixel ramp
+// magnified must reach the *near* edge's value at each end, not the far one's.
+static void test_edge_replication(void) {
+    raster_surface *image = raster_surface_create(2, 2, RASTER_GRAY8);
+    uint8_t *ip = raster_surface_mutable_bytes(image);
+    size_t istride = raster_surface_stride(image);
+    ip[0] = 0;   ip[1] = 255;             // top row: dark left, bright right
+    ip[istride] = 0; ip[istride + 1] = 255;
+
+    raster_surface *target = raster_surface_create(8, 8, RASTER_GRAY8);
+    raster_context *ctx = raster_context_create(target);
+    raster_context_set_antialias(ctx, false);
+    raster_context_set_blend(ctx, RASTER_BLEND_COPY);
+    raster_context_set_interpolation(ctx, RASTER_INTERPOLATION_LOW);
+    raster_context_draw_image(ctx, image, (raster_frect){ 0, 0, 8, 8 });
+
+    const uint8_t *p = raster_surface_bytes(target);
+    size_t stride = raster_surface_stride(target);
+    const uint8_t *row = p + 3 * stride;
+    CHECK(row[0] <= 4, "the left border replicates the dark edge", NULL);
+    CHECK(row[7] >= 251, "the right border replicates the bright edge, not the left one", NULL);
+    for (int x = 1; x < 8; ++x) {
+        ++checks;
+        if (row[x] < row[x - 1]) {
+            fail("a magnified ramp must stay monotonic across the border", NULL);
+            break;
+        }
+    }
+
+    // The same vertically, with a ramp down the rows.
+    ip[0] = 0; ip[1] = 0;
+    ip[istride] = 255; ip[istride + 1] = 255;
+    raster_context_draw_image(ctx, image, (raster_frect){ 0, 0, 8, 8 });
+    // Row 0 of the source lands at device row 0, so device row 0 is dark and row 7 bright.
+    CHECK(p[0 * stride] <= 4, "the top border replicates the top edge", NULL);
+    CHECK(p[7 * stride] >= 251, "the bottom border replicates the bottom edge", NULL);
+
+    raster_context_destroy(ctx);
+    raster_surface_release(target);
+    raster_surface_release(image);
+}
+
+// `.high` must actually be Catmull-Rom and not a second name for bilinear. They agree
+// everywhere the other tests look — both are exact at 1:1 and both average a reduction — so
+// the difference only shows as ringing when a step edge is magnified.
+static void test_high_is_not_bilinear(void) {
+    raster_surface *image = raster_surface_create(4, 1, RASTER_GRAY8);
+    uint8_t *ip = raster_surface_mutable_bytes(image);
+    ip[0] = 64; ip[1] = 64; ip[2] = 192; ip[3] = 192;
+
+    uint8_t low[16], high[16];
+    struct { raster_interpolation quality; uint8_t *out; } runs[] = {
+        { RASTER_INTERPOLATION_LOW, low }, { RASTER_INTERPOLATION_HIGH, high },
+    };
+    for (size_t k = 0; k < 2; ++k) {
+        raster_surface *target = raster_surface_create(16, 1, RASTER_GRAY8);
+        raster_context *ctx = raster_context_create(target);
+        raster_context_set_antialias(ctx, false);
+        raster_context_set_blend(ctx, RASTER_BLEND_COPY);
+        raster_context_set_interpolation(ctx, runs[k].quality);
+        raster_context_draw_image(ctx, image, (raster_frect){ 0, 0, 16, 1 });
+        memcpy(runs[k].out, raster_surface_bytes(target), 16);
+        raster_context_destroy(ctx);
+        raster_surface_release(target);
+    }
+
+    CHECK(memcmp(low, high, 16) != 0, "high and low must not be the same filter", NULL);
+
+    // Bilinear interpolates strictly between its two taps, so it can never leave the source
+    // range. Catmull-Rom's negative lobes must, which is what makes it sharper.
+    int lowOutside = 0, highOutside = 0;
+    for (int x = 0; x < 16; ++x) {
+        if (low[x] < 64 || low[x] > 192) ++lowOutside;
+        if (high[x] < 64 || high[x] > 192) ++highOutside;
+    }
+    CHECK(lowOutside == 0, "bilinear stays inside the source range", NULL);
+    CHECK(highOutside > 0, "Catmull-Rom overshoots a step edge; a tent would not", NULL);
+
+    raster_surface_release(image);
+}
+
+// No colour channel may come out above its own alpha. Catmull-Rom's negative lobes make that
+// reachable: where alpha dips and a colour channel does not, the weighted sums cross, and in
+// premultiplied space the result is an edge that glows. DownsampleTests.swift:72 asserts the
+// same invariant from the app's side, and LiveMaskTests.swift:19-20 the converse.
+//
+// The shapes matter. Random premultiplied noise never triggers it, because colour and alpha
+// ring together; it needs alpha to undershoot where the colour does not.
+static void test_premultiplied_stays_valid(void) {
+    raster_surface *image = raster_surface_create(4, 1, RASTER_RGBA8);
+    uint8_t *ip = raster_surface_mutable_bytes(image);
+    const uint8_t alpha[4] = { 255, 255, 0, 255 };
+    const uint8_t red[4] = { 0, 255, 0, 0 };  // valid premultiplied: red <= alpha everywhere
+    for (int i = 0; i < 4; ++i) {
+        ip[i * 4 + 0] = red[i];
+        ip[i * 4 + 1] = 0;
+        ip[i * 4 + 2] = 0;
+        ip[i * 4 + 3] = alpha[i];
+    }
+
+    raster_surface *target = raster_surface_create(16, 1, RASTER_RGBA8);
+    raster_context *ctx = raster_context_create(target);
+    raster_context_set_antialias(ctx, false);
+    raster_context_set_blend(ctx, RASTER_BLEND_COPY);
+    raster_context_set_interpolation(ctx, RASTER_INTERPOLATION_HIGH);
+    raster_context_draw_image(ctx, image, (raster_frect){ 0, 0, 16, 1 });
+
+    const uint8_t *p = raster_surface_bytes(target);
+    for (int x = 0; x < 16; ++x) {
+        ++checks;
+        if (p[x * 4] > p[x * 4 + 3]) {
+            char buf[160];
+            snprintf(buf, sizeof buf, "pixel %d has red %u above alpha %u",
+                     x, p[x * 4], p[x * 4 + 3]);
+            fail("a resampled colour must not exceed its own alpha", buf);
+            break;
+        }
+    }
+    raster_context_destroy(ctx);
+    raster_surface_release(target);
+    raster_surface_release(image);
+}
+
+static void test_draw_respects_state(void) {
+    raster_surface *image = raster_surface_create(4, 4, RASTER_RGBA8);
+    uint8_t *ip = raster_surface_mutable_bytes(image);
+    size_t istride = raster_surface_stride(image);
+    for (int y = 0; y < 4; ++y)
+        for (int x = 0; x < 4; ++x) {
+            uint8_t *q = ip + (size_t)y * istride + (size_t)x * 4;
+            q[0] = 255; q[1] = 0; q[2] = 0; q[3] = 255;
+        }
+
+    // Alpha scales the source.
+    {
+        raster_surface *target = raster_surface_create(4, 4, RASTER_RGBA8);
+        raster_context *ctx = raster_context_create(target);
+        raster_context_set_antialias(ctx, false);
+        raster_context_set_alpha(ctx, 0.5);
+        raster_context_draw_image(ctx, image, (raster_frect){ 0, 0, 4, 4 });
+        CHECK(raster_surface_bytes(target)[3] == 128, "setAlpha scales an image draw", NULL);
+        raster_context_destroy(ctx); raster_surface_release(target);
+    }
+    // The clip applies.
+    {
+        raster_surface *target = raster_surface_create(4, 4, RASTER_RGBA8);
+        raster_context *ctx = raster_context_create(target);
+        raster_context_set_antialias(ctx, false);
+        raster_context_clip_rect(ctx, (raster_frect){ 2, 0, 2, 4 });
+        raster_context_draw_image(ctx, image, (raster_frect){ 0, 0, 4, 4 });
+        const uint8_t *p = raster_surface_bytes(target);
+        CHECK(p[0 * 4 + 3] == 0, "outside the clip nothing is drawn", NULL);
+        CHECK(p[2 * 4 + 3] == 255, "inside it the image is", NULL);
+        raster_context_destroy(ctx); raster_surface_release(target);
+    }
+    // A rotated CTM is refused, a quarter turn is not.
+    {
+        raster_surface *target = raster_surface_create(8, 8, RASTER_RGBA8);
+        raster_context *ctx = raster_context_create(target);
+        raster_context_set_matrix(ctx, (raster_matrix){ cos(0.4), sin(0.4), -sin(0.4), cos(0.4), 0, 0 });
+        CHECK(raster_context_draw_image(ctx, image, (raster_frect){ 0, 0, 4, 4 })
+                  == RASTER_UNSUPPORTED_TRANSFORM, "a rotated image draw is refused", NULL);
+        raster_context_set_matrix(ctx, (raster_matrix){ cos(M_PI / 2), sin(M_PI / 2),
+                                                        -sin(M_PI / 2), cos(M_PI / 2), 8, 0 });
+        CHECK(raster_context_draw_image(ctx, image, (raster_frect){ 0, 0, 4, 4 }) == RASTER_OK,
+              "a quarter turn is accepted", NULL);
+        raster_context_destroy(ctx); raster_surface_release(target);
+    }
+    // Mixing formats is refused rather than invented.
+    {
+        raster_surface *target = raster_surface_create(4, 4, RASTER_GRAY8);
+        raster_context *ctx = raster_context_create(target);
+        CHECK(raster_context_draw_image(ctx, image, (raster_frect){ 0, 0, 4, 4 })
+                  == RASTER_UNSUPPORTED_TRANSFORM, "RGBA8 into GRAY8 is refused", NULL);
+        raster_context_destroy(ctx); raster_surface_release(target);
+    }
+    // A snapshot of the context, drawn back into it, must see its own frozen pixels.
+    // Drawing has to be the thing that detaches it: there is no fill in between, and
+    // DownsampleCache's mask path is exactly this shape — snapshot, crop a row, draw the
+    // row straight back into the context it came from.
+    {
+        raster_surface *target = raster_surface_create(4, 4, RASTER_RGBA8);
+        raster_context *ctx = raster_context_create(target);
+        raster_context_set_antialias(ctx, false);
+        raster_context_set_blend(ctx, RASTER_BLEND_COPY);
+        raster_context_draw_image(ctx, image, (raster_frect){ 0, 0, 4, 4 });
+
+        raster_surface *snapshot = raster_context_make_snapshot(ctx);
+        // Straight back in, with nothing in between to have detached it.
+        raster_status status = raster_context_draw_image(ctx, snapshot, (raster_frect){ 0, 0, 4, 4 });
+        CHECK(status == RASTER_OK, "drawing a live snapshot back in must succeed", NULL);
+        CHECK(raster_surface_bytes(target)[0] == 255, "and reproduce the red it held", NULL);
+        raster_surface_release(snapshot);
+        raster_context_destroy(ctx); raster_surface_release(target);
+    }
+    // The same with a write in between, which is the sequence the fill path already covers.
+    {
+        raster_surface *target = raster_surface_create(4, 4, RASTER_RGBA8);
+        raster_context *ctx = raster_context_create(target);
+        raster_context_set_antialias(ctx, false);
+        raster_context_set_blend(ctx, RASTER_BLEND_COPY);
+        raster_context_draw_image(ctx, image, (raster_frect){ 0, 0, 4, 4 });
+        raster_surface *snapshot = raster_context_make_snapshot(ctx);
+        double black[4] = { 0, 0, 0, 1 };
+        raster_context_set_fill_color(ctx, black);
+        raster_context_fill_rect(ctx, (raster_frect){ 0, 0, 4, 4 });
+        raster_context_draw_image(ctx, snapshot, (raster_frect){ 0, 0, 4, 4 });
+        CHECK(raster_surface_bytes(target)[0] == 255,
+              "the snapshot still held the red it was taken from", NULL);
+        raster_surface_release(snapshot);
+        raster_context_destroy(ctx); raster_surface_release(target);
+    }
+    raster_surface_release(image);
+}
+
+static void test_crop_intersects(void) {
+    raster_surface *surface = raster_surface_create(10, 10, RASTER_RGBA8);
+
+    raster_surface *inside = raster_surface_crop(surface, 2, 2, 4, 4);
+    CHECK(inside != NULL && raster_surface_width(inside) == 4, "a contained crop is exact", NULL);
+    raster_surface_release(inside);
+
+    // Overhanging is intersected, not refused: RasterSnapshot drops a whole patch when a
+    // crop comes back empty, so refusing here would silently lose painted pixels.
+    raster_surface *over = raster_surface_crop(surface, 8, 8, 5, 5);
+    CHECK(over != NULL, "an overhanging crop is intersected, not refused", NULL);
+    CHECK(over && raster_surface_width(over) == 2 && raster_surface_height(over) == 2,
+          "and comes back clipped to what exists", NULL);
+    raster_surface_release(over);
+
+    CHECK(raster_surface_crop(surface, 10, 0, 1, 1) == NULL, "starting past the edge is empty", NULL);
+    CHECK(raster_surface_crop(surface, 0, 10, 1, 1) == NULL, "likewise vertically", NULL);
+    CHECK(raster_surface_crop(surface, 0, 0, 0, 4) == NULL, "a zero extent is empty", NULL);
+    CHECK(raster_surface_crop(NULL, 0, 0, 1, 1) == NULL, "NULL has nothing to crop", NULL);
+
+    raster_surface_release(surface);
+}
+
 int main(void) {
     test_pixel_edge_definition();
     test_partition();
@@ -1115,6 +1727,17 @@ int main(void) {
     test_fill_against_reference(RASTER_GRAY8, "GRAY8");
     test_piecewise_equals_whole();
     test_copy_on_write();
+
+    test_crop_intersects();
+    test_one_to_one_is_exact();
+    test_nearest_tie_break();
+    test_sampler_against_reference();
+    test_crop_invariance();
+    test_reduction_does_not_alias();
+    test_edge_replication();
+    test_high_is_not_bilinear();
+    test_premultiplied_stays_valid();
+    test_draw_respects_state();
 
     fprintf(stderr, "%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;

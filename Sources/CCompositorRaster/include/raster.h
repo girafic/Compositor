@@ -89,9 +89,12 @@ raster_surface *raster_surface_create_borrowed(void *bytes, size_t width, size_t
 raster_surface *raster_surface_retain(raster_surface *surface);
 void raster_surface_release(raster_surface *surface);
 
-// A view onto a sub-rectangle, sharing the parent's pixels. Returns NULL when the rectangle
-// is empty or reaches outside the surface — callers rely on that, because
-// CGImage.cropping(to:) returns nil for exactly those cases.
+// A view onto a sub-rectangle, sharing the parent's pixels.
+//
+// The rectangle is intersected with the surface rather than refused when it overhangs,
+// matching CGImageCreateWithImageInRect. NULL means the request was empty or missed the
+// surface entirely — the thirteen call sites all branch on that, and three of them treat it
+// as "drop this piece", so refusing an overhang would silently lose pixels.
 raster_surface *raster_surface_crop(raster_surface *surface, size_t x, size_t y,
                                     size_t width, size_t height);
 
@@ -263,6 +266,34 @@ bool raster_device_rect_touched(raster_matrix m, raster_frect rect, raster_rect 
 // 255. Multiply the two axes' answers to get a pixel's coverage.
 void raster_axis_coverage(double lo, double hi, int32_t first, int32_t last, uint8_t *out);
 
+// MARK: - Sampling
+
+// The device-pixel -> source-pixel mapping for drawing an image of `imageWidth` x
+// `imageHeight` into `rect` under `ctm`. Source row 0 maps to the rect's maximum y.
+//
+// Applying the result to a device pixel's *centre* gives a continuous source coordinate in
+// which source pixel i spans [i, i+1) and has its centre at i + 0.5.
+//
+// False when `ctm` is not rectilinear, when the rect or the image is degenerate, or when the
+// mapping is not invertible.
+bool raster_image_mapping(raster_matrix ctm, raster_frect rect,
+                          size_t imageWidth, size_t imageHeight, raster_matrix *out);
+
+// Resamples `count` pixels of `image` into `out`, for device row `y` starting at device
+// column `x0`, under the mapping from raster_image_mapping.
+//
+// `out` receives tightly packed pixels in the image's own format. Samples outside the image
+// replicate its edge rather than fading to transparency, so a reduction does not pull
+// emptiness into the border — which is the artefact TiledLayerRenderer's margins exist to
+// avoid at the layer's own edge.
+//
+// The kernel is chosen by `quality` and stretched by the reduction factor, never by anything
+// derived from the image's size or position: that is what keeps a piece of an image
+// identical to the same region of the whole.
+void raster_sample_row(const raster_surface *image, raster_matrix deviceToImage,
+                       int32_t x0, int32_t y, size_t count,
+                       raster_interpolation quality, uint8_t *out);
+
 // MARK: - Compositing
 
 // One source-over-with-blend of a single RGBA8 pixel.
@@ -361,6 +392,30 @@ const raster_region *raster_context_clip_region(const raster_context *ctx);
 // MARK: Painting
 
 raster_status raster_context_fill_rect(raster_context *ctx, raster_frect rect);
+
+// Draws `image` to fill `rect` in user space.
+//
+// Source row 0 lands at the rect's maximum y, which is what CoreGraphics does and what the
+// app's own flip at BrushRaster.context then cancels, leaving its user space equal to device
+// pixels.
+//
+// All five interpolation qualities agree exactly when the mapping is an integer translation
+// at unit scale, and that is a consequence of the kernels rather than a special case: every
+// one of them gives weight 1 to the sample it lands on and 0 to its neighbours at integer
+// offsets. That identity is load-bearing. RasterSnapshotTests compares a `.high`,
+// antialiasing-off, N-times-clipped render against a `.low`, antialiasing-on, single draw
+// with memcmp over 64 MB, and a hundred-odd other assertions read their result back through
+// a 1:1 draw.
+//
+// `low` and `default` widen their kernel by the reduction factor, because the reduction
+// handed to a single draw is not bounded by 2: the halving chain saturates at level 6, so a
+// 30000-pixel image landing in 100 pixels arrives here as a 4.7x reduction, and the brush's
+// stamp fallback can be far worse. A fixed two-tap filter aliases visibly there. Widening by
+// the *scale* keeps the kernel independent of where the image sits and how big it is, which
+// is what tiled rendering needs — it is prefiltering chosen from the image's own extent that
+// breaks crop invariance, not a wider kernel as such.
+raster_status raster_context_draw_image(raster_context *ctx, const raster_surface *image,
+                                        raster_frect rect);
 
 // CGContextClearRect honours the CTM and the clip but ignores the graphics state's alpha and
 // blend mode. It is therefore *not* "fill with the clear blend" — TiledLayerRenderer does

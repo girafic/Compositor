@@ -465,3 +465,93 @@ raster_status raster_context_clear_rect(raster_context *ctx, raster_frect rect) 
     static const double opaque[4] = { 0, 0, 0, 1 };
     return paint(ctx, rect, RASTER_BLEND_CLEAR, 1.0, opaque);
 }
+
+raster_status raster_context_draw_image(raster_context *ctx, const raster_surface *image,
+                                        raster_frect rect) {
+    if (!ctx || !image) return RASTER_OK;
+    // Converting between the two pixel layouts mid-draw is not something the app ever asks
+    // for — every draw is colour into colour or mask into mask — so it is refused rather
+    // than invented.
+    if (raster_surface_format(image) != raster_surface_format(ctx->target))
+        return RASTER_UNSUPPORTED_TRANSFORM;
+
+    raster_matrix canonical;
+    if (!raster_matrix_is_rectilinear(ctx->state.ctm, rect, &canonical))
+        return RASTER_UNSUPPORTED_TRANSFORM;
+
+    raster_matrix deviceToImage;
+    if (!raster_image_mapping(ctx->state.ctm, rect, raster_surface_width(image),
+                              raster_surface_height(image), &deviceToImage))
+        return RASTER_OK;  // degenerate, not a failure
+
+    double box[4];
+    if (!raster_device_box(canonical, rect, box)) return RASTER_OK;
+
+    bool antialias = ctx->state.antialias;
+    raster_rect area;
+    bool any = antialias ? raster_device_rect_touched(canonical, rect, &area)
+                         : raster_device_rect_covered(canonical, rect, &area);
+    if (!any) return RASTER_OK;
+
+    // Before a single source byte is read. If `image` is a live snapshot of this very
+    // context — which DownsampleCache does deliberately: snapshot, crop one row, draw it
+    // straight back in — this is what gives it a private copy of the pixels it was taken
+    // from, after which the source and the destination no longer overlap.
+    raster_status status = raster_context_detach_snapshots(ctx);
+    if (status != RASTER_OK) return status;
+
+    uint8_t *pixels = raster_surface_mutable_bytes(ctx->target);
+    if (!pixels) return RASTER_OUT_OF_MEMORY;
+
+    size_t stride = raster_surface_stride(ctx->target);
+    raster_format format = raster_surface_format(ctx->target);
+    size_t bpp = raster_bytes_per_pixel(format);
+    uint8_t alpha8 = quantise(ctx->state.alpha);
+    raster_blend blend = ctx->state.blend;
+
+    size_t width = (size_t)(area.x1 - area.x0);
+    // A row of resampled source, a row of column coverage, and a scratch row for the two
+    // partial edge rows an antialiased draw has.
+    if (!scratch_reserve(ctx, width * (bpp + 2))) return RASTER_OUT_OF_MEMORY;
+    uint8_t *samples = ctx->scratch;
+    uint8_t *columnCoverage = ctx->scratch + width * bpp;
+    uint8_t *scaledCoverage = columnCoverage + width;
+    if (antialias) raster_axis_coverage(box[0], box[2], area.x0, area.x1, columnCoverage);
+
+    const raster_region *clip = ctx->state.clip->region;
+    size_t clipCount = raster_region_count(clip);
+    for (size_t i = 0; i < clipCount; ++i) {
+        raster_rect band = raster_region_rect(clip, i);
+        raster_rect hit = {
+            band.x0 > area.x0 ? band.x0 : area.x0, band.y0 > area.y0 ? band.y0 : area.y0,
+            band.x1 < area.x1 ? band.x1 : area.x1, band.y1 < area.y1 ? band.y1 : area.y1,
+        };
+        if (raster_rect_is_empty(hit)) continue;
+
+        size_t count = (size_t)(hit.x1 - hit.x0);
+        for (int32_t y = hit.y0; y < hit.y1; ++y) {
+            const uint8_t *coverage = NULL;
+            if (antialias) {
+                uint8_t row;
+                raster_axis_coverage(box[1], box[3], y, y + 1, &row);
+                if (row == 0) continue;
+                const uint8_t *columns = columnCoverage + (hit.x0 - area.x0);
+                if (row == 255) {
+                    coverage = columns;
+                } else {
+                    for (size_t x = 0; x < count; ++x)
+                        scaledCoverage[x] = (uint8_t)((columns[x] * row + 127) / 255);
+                    coverage = scaledCoverage;
+                }
+            }
+            raster_sample_row(image, deviceToImage, hit.x0, y, count,
+                              ctx->state.interpolation, samples);
+            uint8_t *dst = pixels + (size_t)y * stride + (size_t)hit.x0 * bpp;
+            if (format == RASTER_GRAY8)
+                raster_blend_row_gray(dst, samples, count, blend, alpha8, coverage);
+            else
+                raster_blend_row_rgba(dst, samples, count, blend, alpha8, coverage);
+        }
+    }
+    return RASTER_OK;
+}

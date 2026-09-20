@@ -108,11 +108,19 @@ void raster_surface_release(raster_surface *surface) {
 
 raster_surface *raster_surface_crop(raster_surface *surface, size_t x, size_t y,
                                     size_t width, size_t height) {
-    // Empty or out of bounds returns NULL, because CGImage.cropping(to:) returns nil for
-    // exactly those and five call sites branch on it.
+    // The rectangle is intersected with the surface rather than refused when it overhangs,
+    // which is what CGImageCreateWithImageInRect does. The difference is not academic and
+    // not symmetric: RasterSnapshot.replacing drops a whole patch when a crop comes back
+    // empty, so refusing an overhang would silently lose painted pixels, while intersecting
+    // can only ever return less than was asked for. Several callers build their rectangles
+    // out of floating-point arithmetic and then `.integral`, where overhanging by a pixel is
+    // exactly the kind of thing that happens.
+    //
+    // NULL still means "nothing to crop": an empty request, or one that misses entirely.
     if (!surface || !width || !height) return NULL;
-    if (x > surface->width || y > surface->height) return NULL;
-    if (width > surface->width - x || height > surface->height - y) return NULL;
+    if (x >= surface->width || y >= surface->height) return NULL;
+    if (width > surface->width - x) width = surface->width - x;
+    if (height > surface->height - y) height = surface->height - y;
 
     uint8_t *data = surface->data + y * surface->stride + x * raster_bytes_per_pixel(surface->format);
     ++surface->store->refcount;
