@@ -205,6 +205,11 @@ enum {
     // plane, and something that can sample an image through a rotated transform. The plane on
     // its own is only the place to put the answer, not a way to compute it.
     RASTER_UNSUPPORTED_TRANSFORM = 2,
+    // A surface whose pixel layout the operation has no answer for: an image drawn into a
+    // target of the other format, or a mask that is not GRAY8. Distinct from the above
+    // because the two are told apart only by the message they produce, and a port whose only
+    // Swift check is CI cannot afford a diagnostic that names the wrong cause.
+    RASTER_UNSUPPORTED_FORMAT = 3,
 };
 
 typedef uint32_t raster_interpolation;

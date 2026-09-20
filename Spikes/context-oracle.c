@@ -1658,7 +1658,7 @@ static void test_draw_respects_state(void) {
         raster_surface *target = raster_surface_create(4, 4, RASTER_GRAY8);
         raster_context *ctx = raster_context_create(target);
         CHECK(raster_context_draw_image(ctx, image, (raster_frect){ 0, 0, 4, 4 })
-                  == RASTER_UNSUPPORTED_TRANSFORM, "RGBA8 into GRAY8 is refused", NULL);
+                  == RASTER_UNSUPPORTED_FORMAT, "RGBA8 into GRAY8 is refused", NULL);
         raster_context_destroy(ctx); raster_surface_release(target);
     }
     // A snapshot of the context, drawn back into it, must see its own frozen pixels.
@@ -1994,9 +1994,11 @@ static void test_mask_clip_refusals(void) {
     install_identity(ctx);
     raster_frect all = { 0, 0, 8, 8 };
 
-    CHECK(raster_context_clip_mask(ctx, colour, all) == RASTER_UNSUPPORTED_TRANSFORM,
+    // A format refusal and a transform refusal are separate statuses on purpose: they are
+    // told apart only by the message they produce, and a wrong diagnosis costs an hour.
+    CHECK(raster_context_clip_mask(ctx, colour, all) == RASTER_UNSUPPORTED_FORMAT,
           "a colour mask is refused rather than guessed at", NULL);
-    CHECK(raster_context_clip_mask(ctx, NULL, all) == RASTER_UNSUPPORTED_TRANSFORM,
+    CHECK(raster_context_clip_mask(ctx, NULL, all) == RASTER_UNSUPPORTED_FORMAT,
           "so is a missing mask", NULL);
 
     // A rotation: the app reaches this through LayerRenderer and FolderMaskClip, and it has

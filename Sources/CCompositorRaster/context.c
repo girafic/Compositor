@@ -326,7 +326,7 @@ raster_status raster_context_clip_rect(raster_context *ctx, raster_frect rect) {
 raster_status raster_context_clip_mask(raster_context *ctx, const raster_surface *mask,
                                        raster_frect rect) {
     if (!ctx) return RASTER_OK;
-    if (!mask || raster_surface_format(mask) != RASTER_GRAY8) return RASTER_UNSUPPORTED_TRANSFORM;
+    if (!mask || raster_surface_format(mask) != RASTER_GRAY8) return RASTER_UNSUPPORTED_FORMAT;
 
     // Redundant on its own: raster_image_mapping below repeats this test and would refuse a
     // rotation anyway, so removing this survives every test. It stays because it makes the
@@ -633,7 +633,7 @@ raster_status raster_context_draw_image(raster_context *ctx, const raster_surfac
     // for — every draw is colour into colour or mask into mask — so it is refused rather
     // than invented.
     if (raster_surface_format(image) != raster_surface_format(ctx->target))
-        return RASTER_UNSUPPORTED_TRANSFORM;
+        return RASTER_UNSUPPORTED_FORMAT;
 
     raster_matrix canonical;
     if (!raster_matrix_is_rectilinear(ctx->state.ctm, rect, &canonical))

@@ -186,6 +186,19 @@ public final class CGContext: @unchecked Sendable {
         check(raster_context_clip_path(raster, false), "clip(to:)")
     }
 
+    /// Intersects the clip with `rect`, attenuated by `mask`'s grey values.
+    ///
+    /// The rectangle clips hard, by the same device-pixel centre rule as every other clip
+    /// here; the mask supplies all of the softness inside it. Nested mask clips multiply,
+    /// which is what makes a folder mask compose with a layer's own mask.
+    ///
+    /// The mask is placed exactly as a drawn image is — its first row at the rectangle's
+    /// *maximum* y. `BrushRaster.draw` uses one transform preamble for its mask branch and
+    /// its image branch, which is what says the two placements are the same thing.
+    public func clip(to rect: CGRect, mask: CGImage) {
+        check(raster_context_clip_mask(raster, mask.surface, Self.frect(rect)), "clip(to:mask:)")
+    }
+
     /// Adds a rectangle to the current path. The path belongs to the context, not to the
     /// graphics state: CoreGraphics does not save or restore it, and `LayerRenderer` relies
     /// on that by calling this again immediately after a clip.
@@ -291,10 +304,11 @@ public final class CGContext: @unchecked Sendable {
     /// Turns the engine's refusals into a trap.
     ///
     /// A non-rectilinear transform means the request is a rotated quadrilateral, which a
-    /// rectangle region cannot hold. Approximating it by a bounding box would fail *open* —
-    /// drawing pixels the caller asked to mask away, with nothing downstream to catch it —
-    /// so it fails loudly instead. Unreachable today: the app is not in the build yet, and
-    /// the coverage plane lands before it is.
+    /// rectangle region cannot hold and which the coverage plane can only *store* — filling
+    /// it needs the general affine sampler and a rasteriser for the rotated edges, neither of
+    /// which exists yet. Approximating it by a bounding box would fail *open*, drawing pixels
+    /// the caller asked to mask away with nothing downstream to catch it, so it fails loudly
+    /// instead. Unreachable today: the app is not in the build yet.
     ///
     /// When the first real call site is wired up this becomes fail-*closed* (an empty clip,
     /// which renders nothing and is just as unmissable) rather than a trap, because a
@@ -306,8 +320,13 @@ public final class CGContext: @unchecked Sendable {
         case RasterStatus.unsupportedTransform:
             preconditionFailure("""
                 CGContext.\(what) under a transform that is neither axis-aligned nor a \
-                quarter turn. Rectangle regions cannot express a rotated quadrilateral; \
-                the coverage plane that will is not implemented yet.
+                quarter turn. A rotated quadrilateral needs the general affine sampler and a \
+                rasteriser for its edges; neither is implemented yet.
+                """)
+        case RasterStatus.unsupportedFormat:
+            preconditionFailure("""
+                CGContext.\(what) with a pixel layout it has no answer for: an image must \
+                match its destination's format, and a mask must be 8-bit grayscale.
                 """)
         default:
             preconditionFailure("CGContext.\(what) ran out of memory")
@@ -321,4 +340,5 @@ enum RasterStatus {
     static let ok: raster_status = 0
     static let outOfMemory: raster_status = 1
     static let unsupportedTransform: raster_status = 2
+    static let unsupportedFormat: raster_status = 3
 }
