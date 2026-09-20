@@ -331,6 +331,11 @@ raster_surface *raster_context_make_snapshot(raster_context *ctx) {
     return snapshot;
 }
 
+raster_status raster_context_register_snapshot(raster_context *ctx, raster_surface *snapshot) {
+    if (!ctx || !snapshot) return RASTER_OK;
+    return snapshot_register(ctx, snapshot) ? RASTER_OK : RASTER_OUT_OF_MEMORY;
+}
+
 raster_status raster_context_detach_snapshots(raster_context *ctx) {
     if (!ctx) return RASTER_OK;
     raster_status status = RASTER_OK;

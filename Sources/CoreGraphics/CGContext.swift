@@ -241,6 +241,24 @@ public final class CGContext: @unchecked Sendable {
         check(raster_context_clear_rect(raster, Self.frect(rect)), "clear")
     }
 
+    /// Draws `image` to fill `rect`, honouring the CTM, the clip, the alpha, the blend mode
+    /// and the interpolation quality.
+    ///
+    /// At unit scale with an integer translation every quality selects the source pixel
+    /// exactly, so the same draw at `.low` and at `.high`, with antialiasing on or off, is
+    /// byte for byte the same. That is what `RasterSnapshotTests` compares with `memcmp`
+    /// over a whole 4000×4000 buffer, and what a hundred-odd other assertions rest on when
+    /// they read a result back through a 1:1 draw.
+    public func draw(_ image: CGImage, in rect: CGRect) {
+        check(raster_context_draw_image(raster, image.surface, Self.frect(rect)), "draw")
+    }
+
+    /// Adds a surface derived from one of this context's snapshots — a crop — to the set
+    /// detached before the next write.
+    func register(snapshot: OpaquePointer) {
+        check(raster_context_register_snapshot(raster, snapshot), "cropping")
+    }
+
     // MARK: - Reading back
 
     /// The pixels, writable, and **stable across draws**.
@@ -257,8 +275,10 @@ public final class CGContext: @unchecked Sendable {
     /// A snapshot of the pixels as they are now. Shares them until the next draw.
     public func makeImage() -> CGImage? {
         guard let snapshot = raster_context_make_snapshot(raster) else { return nil }
-        return CGImage(surface: snapshot, colorSpace: colorSpace,
-                       alphaInfo: alphaInfo, bitmapInfo: bitmapInfo)
+        // The image remembers where it came from, so that a crop of it can join the same
+        // detach list rather than quietly keeping this context's store shared.
+        return CGImage(surface: snapshot, colorSpace: colorSpace, alphaInfo: alphaInfo,
+                       bitmapInfo: bitmapInfo, origin: self)
     }
 
     // MARK: - Boundary

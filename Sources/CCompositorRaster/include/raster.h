@@ -446,4 +446,11 @@ raster_status raster_context_clear_rect(raster_context *ctx, raster_frect rect);
 raster_surface *raster_context_make_snapshot(raster_context *ctx);  // caller owns one reference
 raster_status   raster_context_detach_snapshots(raster_context *ctx);
 
+// Adds an existing surface to the context's snapshot list, retaining it. This is how a view
+// derived from a snapshot — a crop, above all — joins the set that gets detached before the
+// next write. Without it the derived view keeps the store shared and the context's own
+// pixels become unwritable, which surfaces as an out-of-memory rather than as corruption,
+// but breaks all the same.
+raster_status raster_context_register_snapshot(raster_context *ctx, raster_surface *snapshot);
+
 #endif
