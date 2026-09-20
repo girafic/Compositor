@@ -111,12 +111,12 @@ untested one; the two results that matter are quoted above.
 
 ## `context-oracle.c` — does the drawing context agree with a brute-force model?
 
-**Answered: yes. 1,082,387 checks, 0 failures**, on two compilers and five optimisation
+**Answered: yes. 1,252,637 checks, 0 failures**, on two compilers and five optimisation
 levels, clean under valgrind and under gcc's AddressSanitizer + UndefinedBehaviorSanitizer.
 
 Covers `coverage.c` (the device-pixel arithmetic), `context.c` (the graphics state stack,
-the clip stack, snapshots, fill and clear) and `draw_image.c` (the sampler) against
-independent models:
+the clip stack, snapshots, fill, clear and mask clips) and `draw_image.c` (the sampler)
+against independent models:
 
 - **The edge rule** against a direct centre test, over random rectilinear matrices from both
   families, with negative scales and negative device origins. The input space is seeded with
@@ -150,6 +150,26 @@ The sampler adds a third stage, against the promises the app's own tests encode:
   the app only asks for 2.
 - **Reduction without aliasing**, edge replication on both sides, Catmull-Rom actually
   differing from the tent kernel, and premultiplied validity (no colour above its own alpha).
+
+Mask clips and the coverage plane add a fourth stage. The first item carries most of it:
+
+- **The mask idiom reproduces its mask.** `BrushRaster.draw(_:in:mask: true, context:)` is
+  copied call for call and the output must equal the input mask byte for byte. That one
+  sequence pins exact resampling at 1:1, the GRAY8 lerp, `setFillColor(gray:)` with `fill`,
+  and the hard rectangle edge — and over a hundred exact pixel assertions across the app's
+  own suite read their results back through it.
+- **A 1x1 mask stretches flat**, which is what `LayerMask.solid(revealing:)` needs.
+- **Nested masks multiply**, `a * b / 255`, and a `restoreGState` leaves the outer plane
+  exactly as it was. Nothing copies to achieve that: a nested clip builds its own plane, so
+  the parent is read-only by construction rather than by discipline.
+- **The plane survives a later rectangle clip.** It sits at the clip region's bounds, so
+  narrowing the region has to re-base it; a flat mask could not tell a correct re-base from a
+  missing one, so the mask has to vary.
+- **The rectangle clips hard even with antialiasing on**, and a soft fill edge crossing a
+  mask multiplies both coverages.
+- **The mask is placed exactly as a drawn image is**, first row at the rectangle's maximum y.
+  That is not a guess: `BrushRaster.draw` uses one transform preamble for its mask branch and
+  its image branch, and `LayerRenderer.drawCoverage` applies the same second flip.
 
 ```sh
 clang -std=gnu11 -Wall -Wextra -Werror -O1 -ISources/CCompositorRaster/include \
@@ -205,6 +225,24 @@ the clamp's loop body left `if (format == RASTER_RGBA8)` with no statement, so i
 compile. A mutant that does not build is not a surviving mutant and not a killed one — it is
 a malformed experiment, and reading it as either would be wrong. It was rewritten to remove
 the whole guard, and in that form it dies.
+
+16 more came with the coverage plane: a plane that is ignored, indexed without its x or its
+y offset, or that drops the antialiasing coverage instead of multiplying it; a product that
+truncates rather than rounds; a nested clip that does not multiply the parent in, or reads it
+at the wrong offset; a mask rectangle that clips soft instead of hard; a clip that accepts a
+colour mask, accepts a rotation, or ignores the interpolation quality; a re-base that does
+not crop, drops the plane, or discards it on construction; and fill and draw each failing to
+apply it. **15 of the 16 were caught, but 5 only after four new tests were written** — and
+none of those 5 was an equivalent mutant. The gaps were all of one kind: the first pass had
+no test that combined antialiasing with a mask, none that nested masks at *different*
+offsets, none with a fractional mask rectangle, and none that varied the interpolation
+quality. Uniform masks over identical full-size rectangles cannot see any of that.
+
+The remaining survivor is genuinely equivalent: the rotation check at the top of
+`clip_mask` is repeated inside `raster_image_mapping`, so removing it changes no answer. It
+stays — the refusal should be that function's own decision rather than a side effect of what
+a callee happens to check — and the source now says so, as the two unreachable branches in
+`region.c` do.
 
 ## `probe-linux-swift.sh` — what does the Linux toolchain actually vend?
 
