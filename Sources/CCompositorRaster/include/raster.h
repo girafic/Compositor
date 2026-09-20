@@ -112,6 +112,16 @@ uint8_t *raster_surface_mutable_bytes(raster_surface *surface);
 // to in place.
 bool raster_surface_is_unique(const raster_surface *surface);
 
+// References to this surface *object*, as opposed to the number of surfaces sharing its
+// pixels — `raster_surface_is_unique` answers that one. The context's snapshot registry uses
+// this to tell a snapshot somebody still holds from one that has already been released, and
+// so to skip the copy for the second kind.
+size_t raster_surface_refcount(const raster_surface *surface);
+
+// False when the caller supplied the memory. Such a surface can never be detached from it,
+// so anything that would need a private copy has to be given one up front instead.
+bool raster_surface_is_owned(const raster_surface *surface);
+
 // Copy-on-write. If the allocation is shared, replaces it with a private copy so the
 // surface can be drawn into without disturbing anyone else's view of the old pixels.
 // Returns false only if the copy could not be allocated.
@@ -170,6 +180,89 @@ raster_region *raster_region_xor(const raster_region *a, const raster_region *b)
 // The hot path: clip(to: rect) under an axis-aligned transform.
 raster_region *raster_region_intersect_rect(const raster_region *region, raster_rect rect);
 
+// MARK: - Device geometry
+
+// Laid out to match CGAffineTransform and CGRect, so Swift can hand them across unchanged.
+typedef struct { double a, b, c, d, tx, ty; } raster_matrix;
+typedef struct { double x, y, width, height; } raster_frect;
+
+// Outcomes that a caller has to tell apart. In particular an empty result and "could not
+// compute" must never arrive as the same thing.
+typedef uint32_t raster_status;
+
+enum {
+    RASTER_OK = 0,
+    RASTER_OUT_OF_MEMORY = 1,
+    // The transform is not rectilinear, so the request would have to be expressed as a
+    // rotated quadrilateral, which a rectangle region cannot hold. Rejected at the boundary
+    // rather than approximated by a bounding box, for the same reason an unsupported blend
+    // mode is rejected rather than silently drawn as Normal: a clip that fails *open* draws
+    // pixels the caller asked to have masked away, and nothing downstream would catch it.
+    // The coverage plane in `raster_clip` is where this stops being a refusal.
+    RASTER_UNSUPPORTED_TRANSFORM = 2,
+};
+
+typedef uint32_t raster_interpolation;
+
+enum {
+    RASTER_INTERPOLATION_DEFAULT = 0,
+    RASTER_INTERPOLATION_NONE = 1,
+    RASTER_INTERPOLATION_LOW = 2,
+    RASTER_INTERPOLATION_HIGH = 3,
+    RASTER_INTERPOLATION_MEDIUM = 4,
+};
+
+// The device pixel column a device-space edge falls on, under the rule that a pixel belongs
+// to a range when its *centre* does: column i spans [i, i+1) with centre i + 0.5, so the
+// range [lo, hi) covers exactly the columns [raster_pixel_edge(lo), raster_pixel_edge(hi)).
+//
+// This is ceil(t - 0.5), which is round-half-*down* — not round(t), and not floor(t + 0.5).
+// Which way ties go is a free choice; what is not free is that both edges make the same
+// choice, because that is what makes two ranges that share an edge partition it exactly,
+// with no pixel doubled and none skipped, at *any* edge position. Tests pin the tie-break so
+// a later "simplification" to floor(t + 0.5) fails loudly rather than quietly.
+//
+// CoreGraphics itself uses the other rule — a pixel belongs when the overlap has positive
+// area — which is why its hard clips hairline on fractional edges and why
+// TiledLayerRenderer rounds clip edges to whole device pixels by hand before using them.
+// The two rules agree exactly when both edges are integers, which is nearly all of this app.
+int32_t raster_pixel_edge(double t);
+
+// True when `m` maps axis-aligned rectangles to axis-aligned rectangles.
+//
+// Two families qualify, and missing the second is a real bug rather than a theoretical one:
+// a quarter turn gives a = d = cos(pi/2) = 6.1e-17 with b, c = +-1, so testing only |b| and
+// |c| rejects every 90-degree layer, which is a one-click user action.
+//
+// The tolerance is rect-relative on purpose. A bare `|b| < 1e-9` is wrong in both
+// directions: over a 4000-pixel rectangle it rejects matrices that are straight to within
+// 4e-6 of a pixel, and at a degenerate scale it accepts anything. What decides the answer is
+// how far the off-diagonal terms actually move a corner of *this* rectangle.
+//
+// On success `out` receives `m` with the negligible pair forced to exact zero, so that
+// 6.1e-17 never leaks into a device coordinate.
+bool raster_matrix_is_rectilinear(raster_matrix m, raster_frect rect, raster_matrix *out);
+
+// The exact device-space box a user rectangle maps to, before any pixel rule is applied:
+// x0, y0, x1, y1 with x0 <= x1 and y0 <= y1. `m` must have passed
+// raster_matrix_is_rectilinear. False when the rectangle is empty or any coordinate is not
+// finite — callers must not reach the integer conversions with a NaN or an infinity, because
+// casting those is undefined and in an optimised build yields an arbitrary region rather
+// than a crash. That is reachable: CGAffineTransform.inverted() returns itself for a
+// singular matrix, and BrushStroke concatenates the result.
+bool raster_device_box(raster_matrix m, raster_frect rect, double out[4]);
+
+// The device pixels a user rectangle covers, under each of the two rules above.
+// `_touched` is the wider one and is the range an antialiased fill writes, with fractional
+// coverage on the boundary pixels; `_covered` is for hard clips and non-antialiased fills.
+bool raster_device_rect_covered(raster_matrix m, raster_frect rect, raster_rect *out);
+bool raster_device_rect_touched(raster_matrix m, raster_frect rect, raster_rect *out);
+
+// Per-pixel coverage of the device interval [lo, hi) over the columns [first, last), written
+// as `last - first` bytes. Only the two end pixels can be partial; everything between is
+// 255. Multiply the two axes' answers to get a pixel's coverage.
+void raster_axis_coverage(double lo, double hi, int32_t first, int32_t last, uint8_t *out);
+
 // MARK: - Compositing
 
 // One source-over-with-blend of a single RGBA8 pixel.
@@ -197,5 +290,105 @@ void raster_fill_row_rgba(uint8_t *dst, const uint8_t src[4], size_t count, rast
                           uint8_t alpha, const uint8_t *coverage);
 void raster_fill_row_gray(uint8_t *dst, uint8_t src, size_t count, raster_blend mode,
                           uint8_t alpha, const uint8_t *coverage);
+
+// MARK: - Contexts
+
+// A drawing destination plus a stack of graphics states. This is what CGContext is.
+//
+// The CTM is stored as user space -> *device* space, already composed with the bitmap's base
+// flip, because that is the matrix every fill needs. Composition itself lives on the Swift
+// side: this object only reads and writes the whole matrix, so there is exactly one graphics
+// state stack (here) and exactly one implementation of pre- versus post-concatenation
+// (CGAffineTransform, already tested). Splitting it the other way needs two stacks kept in
+// lockstep.
+typedef struct raster_context raster_context;
+
+raster_context *raster_context_create(raster_surface *target);  // retains `target`
+void            raster_context_destroy(raster_context *ctx);
+raster_surface *raster_context_target(raster_context *ctx);     // borrowed, not retained
+
+// MARK: Graphics state
+
+// `save` copies the top of the stack; `restore` at depth 0 is a no-op rather than an error.
+// Nothing in the app relies on that — its one apparent imbalance is a single save with two
+// exit paths — but a stack underflow that traps would take the whole test process with it.
+raster_status raster_context_save(raster_context *ctx);
+void          raster_context_restore(raster_context *ctx);
+size_t        raster_context_depth(const raster_context *ctx);
+
+raster_matrix raster_context_matrix(const raster_context *ctx);
+void          raster_context_set_matrix(raster_context *ctx, raster_matrix m);
+
+// Alpha stays a double until the moment it reaches raster_blend_*, which takes a byte.
+// Quantising into the state instead would make setAlpha(0.5) compute with 0.50196 — harmless
+// for a self-comparison, wrong against any hand-computed expectation, and compounding once a
+// transparency layer multiplies a second alpha in (0.5 * 0.5 = 0.25, but 128*128/255^2 =
+// 0.2522).
+void raster_context_set_alpha(raster_context *ctx, double alpha);
+void raster_context_set_blend(raster_context *ctx, raster_blend mode);
+void raster_context_set_antialias(raster_context *ctx, bool on);
+void raster_context_set_interpolation(raster_context *ctx, raster_interpolation quality);
+raster_interpolation raster_context_interpolation(const raster_context *ctx);
+
+// Unpremultiplied RGBA in the destination's own space: for GRAY8 only the first component
+// and the alpha are read.
+void raster_context_set_fill_color(raster_context *ctx, const double rgba[4]);
+
+// MARK: Clipping
+
+// The current path is a list of rectangles and belongs to the *context*, not to the graphics
+// state: CoreGraphics does not save or restore it, and LayerRenderer depends on that — it
+// calls addRect again immediately after a clip. `clip` consumes the list.
+//
+// Curves are absent rather than stubbed, so a premature call site fails to compile instead of
+// silently drawing nothing.
+raster_status raster_context_add_rect(raster_context *ctx, raster_frect rect);
+raster_status raster_context_clip_path(raster_context *ctx, bool even_odd);
+void          raster_context_reset_path(raster_context *ctx);
+
+raster_status raster_context_clip_rect(raster_context *ctx, raster_frect rect);
+
+// The exact device bounds of the clip. False means the clip is empty, which the caller must
+// keep distinct from a degenerate rectangle: raster_region_bounds answers all-zeroes for an
+// empty region, and Swift has to turn "empty" into CGRect.null rather than CGRect.zero.
+// Selection builds an empty clip deliberately, and TiledLayerRenderer insets the result by
+// -64 — from .zero that would be a nonsense 128x128 rectangle at the origin.
+bool raster_context_clip_bounds(const raster_context *ctx, raster_rect *out);
+
+// For tests: the clip region itself, borrowed.
+const raster_region *raster_context_clip_region(const raster_context *ctx);
+
+// MARK: Painting
+
+raster_status raster_context_fill_rect(raster_context *ctx, raster_frect rect);
+
+// CGContextClearRect honours the CTM and the clip but ignores the graphics state's alpha and
+// blend mode. It is therefore *not* "fill with the clear blend" — TiledLayerRenderer does
+// that separately, inside a transparency layer, and the two must not collapse into one.
+raster_status raster_context_clear_rect(raster_context *ctx, raster_frect rect);
+
+// MARK: Snapshots
+
+// The copy-on-write direction is the opposite of the obvious one: the context never moves,
+// the snapshot detaches. CGContext.data has to stay pointer-stable across draws, because
+// RasterSnapshotTests reads it once, clears and redraws, and then reads through the same
+// pointer — and raster_surface_make_unique *moves* the bytes it is called on.
+//
+// So the context holds a retained list of live snapshots and detaches them before any write,
+// including before handing out a writable pointer, which is itself a write in waiting.
+// Detaching is self-cleaning: a snapshot nobody else references is released instead of
+// copied, so an image that was taken and dropped costs a refcount decrement rather than a
+// full-canvas memcpy.
+//
+// A borrowed target cannot be detached at all, so raster_context_make_snapshot copies it
+// eagerly instead.
+//
+// Unfinished, and deliberately recorded here rather than discovered later: a crop of a
+// snapshot shares the same store but is not in this list, so detaching the snapshot would
+// leave the crop aliasing the context's live pixels. DownsampleCache does exactly that —
+// snapshot, crop one row, draw the row back into the same context — so whoever adds
+// cropping must register the derived view with the same context.
+raster_surface *raster_context_make_snapshot(raster_context *ctx);  // caller owns one reference
+raster_status   raster_context_detach_snapshots(raster_context *ctx);
 
 #endif

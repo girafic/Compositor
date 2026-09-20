@@ -145,6 +145,14 @@ bool raster_surface_is_unique(const raster_surface *surface) {
     return surface && surface->store->refcount == 1;
 }
 
+size_t raster_surface_refcount(const raster_surface *surface) {
+    return surface ? surface->refcount : 0;
+}
+
+bool raster_surface_is_owned(const raster_surface *surface) {
+    return surface && surface->store->owned;
+}
+
 uint8_t *raster_surface_mutable_bytes(raster_surface *surface) {
     if (!surface || !raster_surface_is_unique(surface)) return NULL;
     return surface->data;
