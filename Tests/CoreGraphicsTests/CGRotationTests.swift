@@ -53,9 +53,13 @@ struct CGRotationTests {
 
         // Symmetric about the centre: the shape is centred on the origin, so its image must be
         // centred on (12, 12). This is what catches a transform composed in the wrong order.
-        let xs = painted.map(\.x), ys = painted.map(\.y)
-        let minX = try #require(xs.min()), maxX = try #require(xs.max())
-        let minY = try #require(ys.min()), maxY = try #require(ys.max())
+        // Closures rather than key paths: a key path needs a nominal type and these are
+        // labelled tuples.
+        let xs = painted.map { $0.x }, ys = painted.map { $0.y }
+        let minX = try #require(xs.min())
+        let maxX = try #require(xs.max())
+        let minY = try #require(ys.min())
+        let maxY = try #require(ys.max())
         #expect(abs((12 - minX) - (maxX - 12)) <= 1, "centred horizontally")
         #expect(abs((12 - minY) - (maxY - 12)) <= 1, "centred vertically")
         // The half-diagonal of a 14x10 rectangle is 8.6, so nothing can reach the border.
@@ -190,10 +194,12 @@ struct CGRotationTests {
         // that guessed them would pass vacuously on an empty canvas.
         let painted = paintedPixels(context)
         #expect(!painted.isEmpty, "the sheared image lands somewhere")
-        let rows = Set(painted.map(\.y)).sorted()
+        let rows = Set(painted.map { $0.y }).sorted()
         let firstColumns = rows.map { row in paintedColumns(context, row: row).first ?? -1 }
         #expect(rows.count >= 6, "and covers several rows")
-        #expect(try #require(firstColumns.first) != try #require(firstColumns.last),
+        let topRow = try #require(firstColumns.first)
+        let bottomRow = try #require(firstColumns.last)
+        #expect(topRow != bottomRow,
                 "and each row starts at a different column than the last")
         // Monotone, not merely different: a shear slides every row the same way. Decreasing
         // here because a bitmap context's base flip reverses the direction.
