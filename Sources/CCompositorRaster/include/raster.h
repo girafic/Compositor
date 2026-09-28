@@ -196,14 +196,20 @@ typedef uint32_t raster_status;
 enum {
     RASTER_OK = 0,
     RASTER_OUT_OF_MEMORY = 1,
-    // The transform is not rectilinear, so the request would have to be expressed as a
-    // rotated quadrilateral, which a rectangle region cannot hold. Rejected at the boundary
-    // rather than approximated by a bounding box, for the same reason an unsupported blend
-    // mode is rejected rather than silently drawn as Normal: a clip that fails *open* draws
-    // pixels the caller asked to have masked away, and nothing downstream would catch it.
-    // Lifting it needs something that can rasterise a rotated quadrilateral into the coverage
-    // plane, and something that can sample an image through a rotated transform. The plane on
-    // its own is only the place to put the answer, not a way to compute it.
+    // The transform is not rectilinear *and* the operation has no parallelogram path yet.
+    // Since the general affine sampler landed, that is only `add_rect` and `clip_path`: their
+    // current path storage is device-space integer rectangles, which cannot hold a sheared
+    // quadrilateral, and TiledLayerRenderer's own use needs CGPath.subtracting besides.
+    //
+    // Everything else — draw, fill, clear, clip(to:), clip(to:mask:) — accepts any affine
+    // transform. A degenerate or singular one draws nothing rather than refusing, which is
+    // what CoreGraphics does and what the app reaches: CGAffineTransform.inverted() returns
+    // itself for a singular matrix and BrushStroke concatenates the result.
+    //
+    // It is still refused rather than approximated by a bounding box, for the same reason an
+    // unsupported blend mode is rejected rather than silently drawn as Normal: a clip that
+    // fails *open* draws pixels the caller asked to have masked away, and nothing downstream
+    // would catch it.
     RASTER_UNSUPPORTED_TRANSFORM = 2,
     // A surface whose pixel layout the operation has no answer for: an image drawn into a
     // target of the other format, or a mask that is not GRAY8. Distinct from the above
@@ -232,6 +238,15 @@ enum {
 // with no pixel doubled and none skipped, at *any* edge position. Tests pin the tie-break so
 // a later "simplification" to floor(t + 0.5) fails loudly rather than quietly.
 //
+// That guarantee is stronger than it looks, and it is worth knowing why: two abutting
+// rectangles do *not* hand us the same double for their shared edge. CGRect derives maxX as
+// origin + size, so TiledLayerRenderer's grid, which computes each tile's x and width
+// separately, produces neighbours whose shared edge differs in the last bits — measured at
+// up to 1.1e-13 on a realistic layer, on 8 of 11 tile boundaries. The integer collapse here
+// is what absorbs that: both sides land on the same column unless a pixel centre happens to
+// fall inside that 1e-13 window. See the parallelogram section for what this costs once the
+// edge is no longer vertical.
+//
 // CoreGraphics itself uses the other rule — a pixel belongs when the overlap has positive
 // area — which is why its hard clips hairline on fractional edges and why
 // TiledLayerRenderer rounds clip edges to whole device pixels by hand before using them.
@@ -239,6 +254,12 @@ enum {
 int32_t raster_pixel_edge(double t);
 
 // True when `m` maps axis-aligned rectangles to axis-aligned rectangles.
+//
+// This is a fast-path *selector*, not a gate. A rectilinear transform takes the exact integer
+// path in coverage.c; anything else takes the parallelogram path below. Keeping the selector
+// is what preserves the quarter-turn exactness the rest of the engine rests on — the
+// canonicalisation it performs is the reason a 90-degree draw is a bit-exact permutation
+// rather than a resample at 6.1e-17 off the grid.
 //
 // Two families qualify, and missing the second is a real bug rather than a theoretical one:
 // a quarter turn gives a = d = cos(pi/2) = 6.1e-17 with b, c = +-1, so testing only |b| and
@@ -249,13 +270,21 @@ int32_t raster_pixel_edge(double t);
 // 4e-6 of a pixel, and at a degenerate scale it accepts anything. What decides the answer is
 // how far the off-diagonal terms actually move a corner of *this* rectangle.
 //
+// Being rect-relative also means the answer is per-(matrix, rectangle), not per-matrix: the
+// same CTM can take the integer path for a 256-wide rectangle and the parallelogram path for
+// a 4000-wide one. The two paths quantise antialiasing differently — per axis then
+// multiplied, versus the area once — so they can disagree by 1 at that boundary. Pinned by a
+// test rather than left to be discovered.
+//
 // On success `out` receives `m` with the negligible pair forced to exact zero, so that
 // 6.1e-17 never leaks into a device coordinate.
 bool raster_matrix_is_rectilinear(raster_matrix m, raster_frect rect, raster_matrix *out);
 
 // The exact device-space box a user rectangle maps to, before any pixel rule is applied:
 // x0, y0, x1, y1 with x0 <= x1 and y0 <= y1. `m` must have passed
-// raster_matrix_is_rectilinear. False when the rectangle is empty or any coordinate is not
+// raster_matrix_is_rectilinear — on any other matrix this returns false, which every caller
+// reads as "empty", so calling it without the selector first is a silent no-op rather than
+// an error. False when the rectangle is empty or any coordinate is not
 // finite — callers must not reach the integer conversions with a NaN or an infinity, because
 // casting those is undefined and in an optimised build yields an arbitrary region rather
 // than a crash. That is reachable: CGAffineTransform.inverted() returns itself for a
@@ -273,6 +302,72 @@ bool raster_device_rect_touched(raster_matrix m, raster_frect rect, raster_rect 
 // 255. Multiply the two axes' answers to get a pixel's coverage.
 void raster_axis_coverage(double lo, double hi, int32_t first, int32_t last, uint8_t *out);
 
+// MARK: - Parallelograms
+
+// A user rectangle under a transform that is *not* rectilinear — a rotation, a shear, or
+// both. Shear is not hypothetical: ImageResizer applies a non-uniform scale outside
+// LayerRenderer's rotation and says so in its own comment, and any composition of two
+// layers' matrices shears once they differ in both angle and pixel aspect.
+//
+// An affine map takes a rectangle to a *parallelogram*, never a general quadrilateral —
+// opposite sides stay parallel. That is what keeps this cheap: the shape is fully described
+// by its four device corners plus the map back to user space, where containment is two
+// comparisons per axis against the rectangle's own edges.
+//
+// Deliberately *not* normalised to a unit square, though that would make containment
+// `0 <= s < 1` and read more neatly. Normalising divides by each rectangle's own width, so
+// two abutting rectangles compute their shared edge through different arithmetic and disagree
+// by an ulp — measured, and enough to double or drop a pixel whose centre lands on the edge.
+// Comparing against the user-space edges instead means both neighbours test the same literal,
+// and the partition is exact whenever their rectangles agree as doubles.
+typedef struct {
+    raster_matrix toUser;              // device point -> user space
+    double ux0, ux1, uy0, uy1;         // the rectangle, standardised so ux0 < ux1
+    double x[4], y[4];                 // device corners, in order around the shape
+} raster_quad;
+
+// Builds the parallelogram for `rect` under `m`. False when the rectangle is degenerate, the
+// matrix is singular, or anything is not finite — all of which mean "nothing is covered",
+// which is the same answer raster_device_box gives on the rectilinear path.
+bool raster_quad_make(raster_matrix m, raster_frect rect, raster_quad *out);
+
+// The half-open column span of device row `y` whose pixel *centres* lie inside the
+// parallelogram. False when the row covers nothing.
+//
+// This is the only place the covered set is decided. The obvious alternative — map each
+// pixel centre back and test it against the rectangle — is a different arithmetic for the
+// same question, and the two disagree at the last bit, which is exactly one doubled or
+// dropped pixel at a row end. So there is one expression, and it ends in raster_pixel_edge
+// for the reason given there: the integer collapse absorbs the 1e-13 by which two abutting
+// rectangles disagree about their shared edge.
+//
+// What that buys, stated honestly, because "exact" would be a lie: a vertical seam makes one
+// such comparison, a diagonal seam makes one *per row*. The chance of a doubled or dropped
+// pixel therefore goes from ~1e-13 per seam to ~N * 1e-13, about 4e-10 down a 4000-pixel
+// edge. Small enough to build on, not small enough to call exact. It is also why
+// TiledLayerRenderer's rotated tolerance is 12 and its unrotated one is 2.
+bool raster_quad_row_span(const raster_quad *quad, int32_t y, int32_t *x0, int32_t *x1);
+
+// The exact bounding box of the covered pixel set — found by walking the rows, so it is
+// tighter than the rounded-out box of the geometry and is honest for
+// boundingBoxOfClipPath. False when nothing is covered at all, which a sliver narrower than
+// a pixel reaches while still having a non-empty geometric box; the clip must collapse to
+// empty there, or Swift reports a rectangle where it owes CGRect.null.
+//
+// Allocates nothing: the cost is one pass over the rows, which is what lets a rotated clip
+// avoid materialising a coverage plane it may never read.
+bool raster_quad_covered_bounds(const raster_quad *quad, raster_rect *out);
+
+// Exact area coverage of each pixel in `[x0, x0 + count)` of row `y`: the area of the pixel
+// square intersected with the parallelogram, in 0...255.
+//
+// Exact rather than supersampled, because a rotated layer's edge is the one place the app
+// has no tolerance to spare and because an exact answer is checkable — the areas must sum to
+// |det| times the rectangle's area, which catches any doubled or dropped sliver in one
+// assertion. Used when antialiasing is on; raster_quad_row_span is the hard-edged answer.
+void raster_quad_coverage_row(const raster_quad *quad, int32_t x0, int32_t y, size_t count,
+                              uint8_t *out);
+
 // MARK: - Sampling
 
 // The device-pixel -> source-pixel mapping for drawing an image of `imageWidth` x
@@ -281,8 +376,13 @@ void raster_axis_coverage(double lo, double hi, int32_t first, int32_t last, uin
 // Applying the result to a device pixel's *centre* gives a continuous source coordinate in
 // which source pixel i spans [i, i+1) and has its centre at i + 0.5.
 //
-// False when `ctm` is not rectilinear, when the rect or the image is degenerate, or when the
-// mapping is not invertible.
+// General affine: rotation and shear are handled, not refused. The tensor-product kernel in
+// raster_sample_row is applied in *source* space, which is valid under any affine map, so
+// nothing about a rotated draw needs a separate path — only the destination extent does.
+// A rectilinear `ctm` is still canonicalised on the way through, because that is what keeps a
+// quarter turn a bit-exact permutation.
+//
+// False when the rect or the image is degenerate, or when the mapping is not invertible.
 bool raster_image_mapping(raster_matrix ctm, raster_frect rect,
                           size_t imageWidth, size_t imageHeight, raster_matrix *out);
 
@@ -384,6 +484,22 @@ raster_status raster_context_add_rect(raster_context *ctx, raster_frect rect);
 raster_status raster_context_clip_path(raster_context *ctx, bool even_odd);
 void          raster_context_reset_path(raster_context *ctx);
 
+// Intersects the clip with `rect` under the current CTM.
+//
+// Under a rectilinear CTM this is a region intersection and nothing else. Under any other
+// affine transform the rectangle becomes a parallelogram, and the clip carries it as a shape
+// alongside its region rather than rasterising it: `raster_clip` holds a short list of
+// parallelograms, and a row's coverage is the plane times each of them. That is not an
+// optimisation for its own sake — BrushStroke clips inside its per-dab loop, roughly 14 dabs
+// per mouse move, and materialising a plane there would mean a multi-megabyte calloc per dab
+// on the one path the app has a performance document about.
+//
+// A rotated clip honours the antialias flag, where a rectilinear one is always hard. That
+// looks inconsistent and is not: on integer geometry the flag is provably invisible (a test
+// pins it), so the rectilinear path loses nothing by ignoring it, whereas a rotated edge is
+// never integer and a hard clip around an antialiased draw throws the smoothing away again —
+// worst at 45 degrees, on every masked rotated layer. TiledLayerRenderer turns antialiasing
+// off exactly where it needs neighbouring pieces to meet, so honouring the flag gives both.
 raster_status raster_context_clip_rect(raster_context *ctx, raster_frect rect);
 
 // Intersects the clip with `rect` and attenuates it by `mask`'s grey values, sampled over that
@@ -397,10 +513,10 @@ raster_status raster_context_clip_rect(raster_context *ctx, raster_frect rect);
 // `mask` must be GRAY8. The app's masks are all DeviceGray with alphaInfo .none, and a colour
 // image would raise a question (its grey? its alpha?) that is better refused than guessed.
 //
-// Returns RASTER_UNSUPPORTED_TRANSFORM under a non-rectilinear CTM. That case is real rather
-// than theoretical -- LayerRenderer and FolderMaskClip both clip inside a rotate(by:) -- and it
-// needs the general affine sampler, not the coverage plane, so it is refused here and lifted
-// with the sampler. A clip that fails open draws pixels the caller asked to have masked away.
+// Any affine transform is accepted. Under rotation the sampled mask multiplies the
+// parallelogram's coverage, exactly as it multiplies the enclosing rectangle otherwise, and
+// the case is thoroughly real: LayerRenderer and FolderMaskClip both clip inside a
+// rotate(by:).
 raster_status raster_context_clip_mask(raster_context *ctx, const raster_surface *mask,
                                        raster_frect rect);
 
@@ -414,6 +530,13 @@ raster_status raster_context_clip_mask(raster_context *ctx, const raster_surface
 // black along one edge does not shrink the bounds. This is read as geometry rather than as a
 // hint — AdjustmentSurface sizes an offscreen from it and Grain anchors its pattern to the
 // resulting origin — so it has to depend only on things the caller can predict.
+//
+// For a rotated clip these device bounds are still exact — raster_quad_covered_bounds walks
+// the rows rather than rounding the geometry out. What is *not* tight is what Swift does with
+// them afterwards: mapping a device box back through a rotated CTM yields the box of a box,
+// four times the area at 45 degrees. That is inherent in answering with a CGRect, and
+// CGContextGetClipBoundingBox has the same property, but it means the Swift-side promise has
+// to read "a bound" rather than "tight" under rotation.
 bool raster_context_clip_bounds(const raster_context *ctx, raster_rect *out);
 
 // For tests: the clip region itself, borrowed.

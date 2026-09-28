@@ -2332,6 +2332,301 @@ static void test_mask_clip_against_reference(void) {
     }
 }
 
+// MARK: - Stage 5: the parallelogram, for transforms that are not rectilinear
+
+#define QW 40
+#define QH 30
+
+
+// Entries that are exactly representable and translations on a quarter-integer grid, so pixel
+// centres land *exactly* on rectangle edges. Uniform random doubles would never reach the tie
+// cases, and the ties are the only inputs that can break the partition.
+static raster_matrix quad_adversarial_matrix(void) {
+    static const double entries[] = { 1.0, -1.0, 0.5, -0.5, 2.0, -2.0, 0.25, 1.5 };
+    raster_matrix m;
+    m.a = entries[next_random() % 8];
+    m.b = entries[next_random() % 8];
+    m.c = entries[next_random() % 8];
+    m.d = entries[next_random() % 8];
+    m.tx = (double)(int)(next_random() % 80) / 4.0 - 10.0;
+    m.ty = (double)(int)(next_random() % 80) / 4.0 - 10.0;
+    return m;
+}
+
+static int quadTiling, quadNotTiling;
+
+// Cutting a rectangle into strips must cover every pixel exactly once.
+//
+// The subtlety this exists for: two abutting strips only share an edge *as a double* when the
+// caller's arithmetic happens to be exact. CGRect stores origin and size, so a strip's far
+// edge is `x + width`, and `lo + (hi - lo) == hi` is not an identity. Where it fails the
+// strips genuinely overlap or gap by an ulp in user space, and the engine correctly covers a
+// pixel whose centre lands in that sliver twice or not at all. So the strict assertions run
+// only on the seeds where the rectangles really do tile — and both counts are reported, so
+// this cannot quietly become vacuous.
+static void test_quad_partition(bool cgRectSemantics, const char *label) {
+    for (unsigned seed = 1; seed <= 4000; ++seed) {
+        rngState = seed * 2654435761u + 7;
+        raster_matrix m = quad_adversarial_matrix();
+        if (fabs(m.a * m.d - m.b * m.c) < 1e-9) continue;
+
+        double x = (double)(int)(next_random() % 40) / 4.0;
+        double y = (double)(int)(next_random() % 40) / 4.0;
+        double w = 4.0 + (double)(int)(next_random() % 32) / 4.0;
+        double h = 4.0 + (double)(int)(next_random() % 32) / 4.0;
+        int k = 2 + (int)(next_random() % 3);
+
+        raster_frect whole = { x, y, w, h };
+        raster_quad all;
+        if (!raster_quad_make(m, whole, &all)) continue;
+
+        raster_frect strip[5];
+        for (int piece = 0; piece < k; ++piece) {
+            if (cgRectSemantics) {
+                double lo = x + w * (double)piece / (double)k;
+                double hi = x + w * (double)(piece + 1) / (double)k;
+                strip[piece] = (raster_frect){ lo, y, hi - lo, h };
+            } else {
+                double unit = w / (double)k;
+                strip[piece] = (raster_frect){ x + unit * piece, y, unit, h };
+            }
+        }
+
+        bool tiles = strip[0].x == x && strip[k - 1].x + strip[k - 1].width == x + w;
+        for (int piece = 0; piece + 1 < k && tiles; ++piece)
+            if (strip[piece].x + strip[piece].width != strip[piece + 1].x) tiles = false;
+        if (tiles) ++quadTiling; else ++quadNotTiling;
+        if (!tiles) continue;
+
+        signed char count[QH][QW];
+        memset(count, 0, sizeof count);
+        for (int piece = 0; piece < k; ++piece) {
+            raster_quad q;
+            if (!raster_quad_make(m, strip[piece], &q)) continue;
+            for (int row = 0; row < QH; ++row) {
+                int32_t a, b;
+                if (!raster_quad_row_span(&q, row, &a, &b)) continue;
+                if (a < 0) a = 0;
+                if (b > QW) b = QW;
+                for (int32_t col = a; col < b; ++col) ++count[row][col];
+            }
+        }
+
+        for (int row = 0; row < QH; ++row) {
+            int32_t a, b;
+            bool any = raster_quad_row_span(&all, row, &a, &b);
+            if (!any) { a = 0; b = 0; }
+            if (a < 0) a = 0;
+            if (b > QW) b = QW;
+            for (int col = 0; col < QW; ++col) {
+                bool inside = col >= a && col < b;
+                int got = count[row][col];
+                ++checks;
+                if (got != (inside ? 1 : 0)) {
+                    char buf[240];
+                    snprintf(buf, sizeof buf,
+                             "%s seed %u k=%d at (%d,%d): drawn %d times, whole says %d "
+                             "(m = %g %g %g %g %g %g, rect %g,%g %gx%g)",
+                             label, seed, k, col, row, got, inside ? 1 : 0,
+                             m.a, m.b, m.c, m.d, m.tx, m.ty, x, y, w, h);
+                    fail("a strip partition covers each pixel exactly once", buf);
+                    row = QH; break;
+                }
+            }
+        }
+    }
+}
+
+// Exact area against 16x16 supersampling. Catches the polygon clipper's degeneracies: a
+// vertex exactly on a pixel edge, an empty intersection, and the shoelace sign for a
+// negative-determinant (mirrored) shape.
+static void test_quad_area_against_supersampling(void) {
+    int worst = 0;
+    for (unsigned seed = 1; seed <= 400; ++seed) {
+        rngState = seed * 40503u + 11;
+        raster_matrix m = quad_adversarial_matrix();
+        if (fabs(m.a * m.d - m.b * m.c) < 1e-9) continue;
+        raster_frect rect = { (double)(int)(next_random() % 40) / 4.0,
+                              (double)(int)(next_random() % 40) / 4.0,
+                              3.0 + (double)(int)(next_random() % 20) / 4.0,
+                              3.0 + (double)(int)(next_random() % 20) / 4.0 };
+        raster_quad q;
+        if (!raster_quad_make(m, rect, &q)) continue;
+
+        for (int row = 0; row < QH; ++row) {
+            uint8_t exact[QW];
+            raster_quad_coverage_row(&q, 0, row, QW, exact);
+            for (int col = 0; col < QW; ++col) {
+                int hits = 0;
+                for (int sy = 0; sy < 16; ++sy)
+                    for (int sx = 0; sx < 16; ++sx) {
+                        double px = col + (sx + 0.5) / 16.0, py = row + (sy + 0.5) / 16.0;
+                        double u = q.toUser.a * px + q.toUser.c * py + q.toUser.tx;
+                        double v = q.toUser.b * px + q.toUser.d * py + q.toUser.ty;
+                        if (u >= q.ux0 && u < q.ux1 && v >= q.uy0 && v < q.uy1) ++hits;
+                    }
+                int reference = (int)(hits * 255.0 / 256.0 + 0.5);
+                int delta = abs((int)exact[col] - reference);
+                if (delta > worst) worst = delta;
+                ++checks;
+                if (delta > 10) {
+                    char buf[200];
+                    snprintf(buf, sizeof buf, "seed %u at (%d,%d): exact %u, 16x16 says %d",
+                             seed, col, row, exact[col], reference);
+                    fail("exact area agrees with supersampling", buf);
+                    row = QH; break;
+                }
+            }
+        }
+    }
+    fprintf(stderr, "  (worst area-vs-supersampling delta: %d of 255)\n", worst);
+}
+
+// The areas must sum to |det| times the rectangle's area. One assertion that catches every
+// doubled or dropped sliver in the polygon clipper.
+static void test_quad_conservation(void) {
+    double worst = 0;
+    for (unsigned seed = 1; seed <= 800; ++seed) {
+        rngState = seed * 22695477u + 3;
+        raster_matrix m = quad_adversarial_matrix();
+        double det = m.a * m.d - m.b * m.c;
+        if (fabs(det) < 1e-9) continue;
+        raster_frect rect = { (double)(int)(next_random() % 20) / 4.0 + 4.0,
+                              (double)(int)(next_random() % 20) / 4.0 + 4.0,
+                              2.0 + (double)(int)(next_random() % 12) / 4.0,
+                              2.0 + (double)(int)(next_random() % 12) / 4.0 };
+        raster_quad q;
+        if (!raster_quad_make(m, rect, &q)) continue;
+
+        double lo = q.x[0], hi = q.x[0], ylo = q.y[0], yhi = q.y[0];
+        for (int i = 1; i < 4; ++i) {
+            if (q.x[i] < lo) lo = q.x[i];
+            if (q.x[i] > hi) hi = q.x[i];
+            if (q.y[i] < ylo) ylo = q.y[i];
+            if (q.y[i] > yhi) yhi = q.y[i];
+        }
+        if (lo < 1 || hi > QW - 1 || ylo < 1 || yhi > QH - 1) continue;  // clamping would lose area
+
+        double total = 0;
+        for (int row = 0; row < QH; ++row) {
+            uint8_t cov[QW];
+            raster_quad_coverage_row(&q, 0, row, QW, cov);
+            for (int col = 0; col < QW; ++col) total += cov[col] / 255.0;
+        }
+        double expected = fabs(det) * rect.width * rect.height;
+        double delta = fabs(total - expected);
+        if (delta > worst) worst = delta;
+        ++checks;
+        if (delta > 0.5) {
+            char buf[200];
+            snprintf(buf, sizeof buf, "seed %u: summed %.4f, expected %.4f", seed, total, expected);
+            fail("coverage conserves area", buf);
+        }
+    }
+    fprintf(stderr, "  (worst conservation error: %.4f px^2)\n", worst);
+}
+
+// Where both paths apply, they must agree exactly — the quad path must be a generalisation,
+// not a second opinion.
+static void test_quad_agrees_with_rectilinear(void) {
+    static const raster_matrix axis[] = {
+        { 1, 0, 0, 1, 0, 0 }, { 1, 0, 0, -1, 0, 20 }, { 2, 0, 0, 2, 3, 5 },
+        { -1, 0, 0, 1, 30, 0 }, { 0.5, 0, 0, 0.5, 1.25, 2.75 },
+        { 0, 1, -1, 0, 20, 0 },  // a quarter turn, canonicalised
+    };
+    for (size_t i = 0; i < sizeof axis / sizeof axis[0]; ++i)
+        for (int trial = 0; trial < 60; ++trial) {
+            rngState = (unsigned)(i * 97 + trial) * 69069u + 1;
+            raster_frect rect = { (double)(int)(next_random() % 40) / 4.0,
+                                  (double)(int)(next_random() % 40) / 4.0,
+                                  1.0 + (double)(int)(next_random() % 30) / 4.0,
+                                  1.0 + (double)(int)(next_random() % 30) / 4.0 };
+            raster_rect integer;
+            bool hasInteger = raster_device_rect_covered(axis[i], rect, &integer);
+            raster_quad q;
+            bool hasQuad = raster_quad_make(axis[i], rect, &q);
+            if (!hasQuad) { CHECK(!hasInteger, "both paths agree there is nothing", NULL); continue; }
+
+            for (int row = 0; row < QH; ++row) {
+                int32_t a = 0, b = 0;
+                bool any = raster_quad_row_span(&q, row, &a, &b);
+                bool wanted = hasInteger && row >= integer.y0 && row < integer.y1;
+                char buf[220];
+                snprintf(buf, sizeof buf,
+                         "matrix %zu rect %g,%g %gx%g row %d: quad %d [%d,%d), integer %d [%d,%d)",
+                         i, rect.x, rect.y, rect.width, rect.height, row, any, a, b, wanted,
+                         integer.x0, integer.x1);
+                CHECK(any == wanted, "the quad path agrees with the integer path on rows", buf);
+                if (any && wanted) CHECK(a == integer.x0 && b == integer.x1, "and on columns", buf);
+            }
+        }
+}
+
+// The bounds must be the covered set's, not the geometry's rounded out — and a sliver that
+// contains no pixel centre must report nothing, or Swift owes CGRect.null and hands back a
+// rectangle instead.
+static void test_quad_covered_bounds(void) {
+    for (unsigned seed = 1; seed <= 1200; ++seed) {
+        rngState = seed * 1664525u + 1013904223u;
+        raster_matrix m = quad_adversarial_matrix();
+        if (fabs(m.a * m.d - m.b * m.c) < 1e-9) continue;
+        raster_frect rect = { (double)(int)(next_random() % 40) / 4.0,
+                              (double)(int)(next_random() % 40) / 4.0,
+                              0.25 + (double)(int)(next_random() % 24) / 4.0,
+                              0.25 + (double)(int)(next_random() % 24) / 4.0 };
+        raster_quad q;
+        if (!raster_quad_make(m, rect, &q)) continue;
+
+        raster_rect bounds;
+        bool any = raster_quad_covered_bounds(&q, &bounds);
+
+        // Brute force: every row's span, over a generous window.
+        bool found = false;
+        raster_rect brute = { 0, 0, 0, 0 };
+        for (int32_t row = -60; row < 60; ++row) {
+            int32_t a, b;
+            if (!raster_quad_row_span(&q, row, &a, &b)) continue;
+            if (!found) { brute = (raster_rect){ a, row, b, row + 1 }; found = true; }
+            else {
+                if (a < brute.x0) brute.x0 = a;
+                if (b > brute.x1) brute.x1 = b;
+                brute.y1 = row + 1;
+            }
+        }
+        char buf[220];
+        snprintf(buf, sizeof buf, "seed %u rect %g,%g %gx%g: reported %d, brute force %d",
+                 seed, rect.x, rect.y, rect.width, rect.height, any, found);
+        CHECK(any == found, "covered bounds agree with brute force on emptiness", buf);
+        if (any && found) {
+            snprintf(buf, sizeof buf, "seed %u: reported %d,%d..%d,%d brute %d,%d..%d,%d",
+                     seed, bounds.x0, bounds.y0, bounds.x1, bounds.y1,
+                     brute.x0, brute.y0, brute.x1, brute.y1);
+            CHECK(bounds.x0 == brute.x0 && bounds.y0 == brute.y0 &&
+                  bounds.x1 == brute.x1 && bounds.y1 == brute.y1,
+                  "and on the box itself", buf);
+        }
+    }
+}
+
+static void test_quad_degenerate(void) {
+    raster_quad q;
+    raster_frect unit = { 0, 0, 4, 4 };
+    CHECK(!raster_quad_make((raster_matrix){ 1, 0, 0, 0, 0, 0 }, unit, &q),
+          "a singular matrix covers nothing", NULL);
+    CHECK(!raster_quad_make((raster_matrix){ 0, 0, 0, 0, 0, 0 }, unit, &q),
+          "so does the zero matrix", NULL);
+    CHECK(!raster_quad_make((raster_matrix){ 1, 0.5, 0.5, 1, 0, 0 }, (raster_frect){ 0, 0, 0, 4 }, &q),
+          "so does a zero-width rectangle", NULL);
+    CHECK(!raster_quad_make((raster_matrix){ 1, 0.5, 0.5, 1, NAN, 0 }, unit, &q),
+          "a NaN never reaches an integer cast", NULL);
+    CHECK(!raster_quad_make((raster_matrix){ 1, 0.5, 0.5, 1, INFINITY, 0 }, unit, &q),
+          "nor does an infinity", NULL);
+    // A negative extent standardises rather than vanishing, as CGRect does.
+    CHECK(raster_quad_make((raster_matrix){ 1, 0.5, 0.5, 1, 0, 0 },
+                           (raster_frect){ 4, 4, -4, -4 }, &q),
+          "a negative extent standardises", NULL);
+}
+
 int main(void) {
     test_pixel_edge_definition();
     test_partition();
@@ -2372,6 +2667,15 @@ int main(void) {
     test_nested_masks_at_an_offset();
     test_mask_clip_honours_interpolation();
     test_mask_clip_against_reference();
+
+    test_quad_partition(false, "shared-unit");
+    test_quad_partition(true, "CGRect-semantics");
+    fprintf(stderr, "  (strips tiled exactly in %d cases, not in %d)\n", quadTiling, quadNotTiling);
+    test_quad_area_against_supersampling();
+    test_quad_conservation();
+    test_quad_agrees_with_rectilinear();
+    test_quad_covered_bounds();
+    test_quad_degenerate();
 
     fprintf(stderr, "%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
