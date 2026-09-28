@@ -225,9 +225,13 @@ public final class CGContext: @unchecked Sendable {
     /// for an empty marquee, and `TiledLayerRenderer` insets this value by −64 — from `.zero`
     /// that would be a nonsense 128×128 rectangle at the origin instead of nothing.
     ///
-    /// The value is the rasterised bounds mapped back, so it is exactly tight rather than the
-    /// strict superset CoreGraphics can return. Every consumer either takes `.integral` and
-    /// sizes a buffer from it, insets it before use, or uses it only to cull.
+    /// The device bounds are exact — they come from walking the covered pixels, not from
+    /// rounding the geometry out. Under a rotated CTM the *user-space* answer cannot be tight
+    /// even so: mapping a device box back through the rotation gives the box of a box, four
+    /// times the area at 45°. That is inherent in answering with a `CGRect`, and
+    /// `CGContextGetClipBoundingBox` has the same property. Every consumer either takes
+    /// `.integral` and sizes a buffer from it, insets it before use, or uses it only to cull —
+    /// so a larger answer costs work and never loses pixels.
     public var boundingBoxOfClipPath: CGRect {
         var bounds = raster_rect()
         guard raster_context_clip_bounds(raster, &bounds) else { return .null }
@@ -303,12 +307,16 @@ public final class CGContext: @unchecked Sendable {
 
     /// Turns the engine's refusals into a trap.
     ///
-    /// A non-rectilinear transform means the request is a rotated quadrilateral, which a
-    /// rectangle region cannot hold and which the coverage plane can only *store* — filling
-    /// it needs the general affine sampler and a rasteriser for the rotated edges, neither of
-    /// which exists yet. Approximating it by a bounding box would fail *open*, drawing pixels
-    /// the caller asked to mask away with nothing downstream to catch it, so it fails loudly
-    /// instead. Unreachable today: the app is not in the build yet.
+    /// A non-rectilinear transform is now only refused by `addRect` and the path clips: their
+    /// storage is device-space integer rectangles, and a sheared rectangle is not one. Drawing,
+    /// filling and both kinds of clip take the parallelogram path instead, and a singular
+    /// transform draws nothing rather than refusing — which it has to, because
+    /// `CGAffineTransform.inverted()` hands back a singular matrix unchanged and `BrushStroke`
+    /// concatenates the result.
+    ///
+    /// What is left is refused rather than approximated by a bounding box, because that would
+    /// fail *open* — drawing pixels the caller asked to mask away, with nothing downstream to
+    /// catch it. Unreachable today: the app is not in the build yet.
     ///
     /// When the first real call site is wired up this becomes fail-*closed* (an empty clip,
     /// which renders nothing and is just as unmissable) rather than a trap, because a
@@ -320,8 +328,9 @@ public final class CGContext: @unchecked Sendable {
         case RasterStatus.unsupportedTransform:
             preconditionFailure("""
                 CGContext.\(what) under a transform that is neither axis-aligned nor a \
-                quarter turn. A rotated quadrilateral needs the general affine sampler and a \
-                rasteriser for its edges; neither is implemented yet.
+                quarter turn. Drawing, filling and both kinds of clip accept any affine \
+                transform; the current path does not, because it stores device-space integer \
+                rectangles and a sheared rectangle is not one.
                 """)
         case RasterStatus.unsupportedFormat:
             preconditionFailure("""
