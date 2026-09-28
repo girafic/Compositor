@@ -111,12 +111,12 @@ untested one; the two results that matter are quoted above.
 
 ## `context-oracle.c` — does the drawing context agree with a brute-force model?
 
-**Answered: yes. 1,252,637 checks, 0 failures**, on two compilers and five optimisation
+**Answered: yes. 9,960,060 checks, 0 failures**, on two compilers and four optimisation
 levels, clean under valgrind and under gcc's AddressSanitizer + UndefinedBehaviorSanitizer.
 
 Covers `coverage.c` (the device-pixel arithmetic), `context.c` (the graphics state stack,
-the clip stack, snapshots, fill, clear and mask clips) and `draw_image.c` (the sampler)
-against independent models:
+the clip stack, snapshots, fill, clear and mask clips), `draw_image.c` (the sampler) and
+`quad.c` (transforms that are not rectilinear) against independent models:
 
 - **The edge rule** against a direct centre test, over random rectilinear matrices from both
   families, with negative scales and negative device origins. The input space is seeded with
@@ -170,6 +170,46 @@ Mask clips and the coverage plane add a fourth stage. The first item carries mos
 - **The mask is placed exactly as a drawn image is**, first row at the rectangle's maximum y.
   That is not a guess: `BrushRaster.draw` uses one transform preamble for its mask branch and
   its image branch, and `LayerRenderer.drawCoverage` applies the same second flip.
+
+Rotation and shear add two more stages — the parallelogram's geometry, then the same through
+the context. The one that matters is the partition counter:
+
+- **Cutting a rectangle into strips covers every pixel exactly once.** Run twice: once with
+  both neighbours handed the same literal for the seam, and once built the way `CGRect` forces
+  — origin and size computed separately, as `TiledLayerRenderer.Frame.mapped` does. The strict
+  assertions run only on the seeds where the rectangles genuinely tile (6868 of 7392), because
+  where they do not the strips overlap by an ulp in user space and the engine is *correctly*
+  covering a pixel whose centre lands in that sliver. Both counts are printed so the test
+  cannot quietly go vacuous.
+- **Exact area against 16×16 supersampling** (worst delta 9 of 255) and **conservation** — the
+  areas sum to |det| times the rectangle's area, within 0.025 px². One assertion that catches
+  any doubled or dropped sliver in the polygon clipper.
+- **The two paths agree where both apply.** This is not tidiness: the rectilinear selector is
+  per-(matrix, rectangle), so one CTM can send a narrow rectangle down the integer path and a
+  wide one down the parallelogram path.
+- **Through the context:** a rotated fill against a supersampled reference; a hard rotated clip
+  covering exactly the pixels the same fill would; the antialias flag honoured; five *different*
+  rotated clips composing over a mask clip; a singular transform drawing nothing rather than
+  refusing; a quarter turn still an exact permutation; and shear, which reaches the engine
+  without any rotation at all.
+
+### What the prefilter measurement settled
+
+`stretches()` widens the resampling kernel by the reduction factor, and generalising it to a
+non-rectilinear transform has two defensible answers. The L1 norm of the Jacobian row is the
+device pixel's footprint projected onto the source axis — the textbook answer for a box
+footprint. The L2 norm matches the isotropic case instead.
+
+Measured, L1 is worse on both counts:
+
+| | intermediate px across a hard edge at unit scale | 4× rotated reduction spread |
+|---|---|---|
+| L2 (`hypot`) | 1 at 15°, 30° and 45° | 1 |
+| L1 | 2, 2, 3 | **9 at 15°** |
+
+`DownsampleTests` asks for a spread under 6, so L1 would fail the app's own metric. A pure
+rotation is an isometry with nothing to prefilter, and L2 is what says so. Both numbers are now
+assertions, so the trade is not silently made again.
 
 ```sh
 clang -std=gnu11 -Wall -Wextra -Werror -O1 -ISources/CCompositorRaster/include \
@@ -243,6 +283,23 @@ The remaining survivor is genuinely equivalent: the rotation check at the top of
 stays — the refusal should be that function's own decision rather than a side effect of what
 a callee happens to check — and the source now says so, as the two unreachable branches in
 `region.c` do.
+
+18 more came with rotation and shear. **16 of the 18 were caught, and 4 only after new tests**
+— and three of those four had a single cause worth remembering: the nesting test used six
+copies of *one* shape, and intersecting a shape with itself is idempotent. So dropping the
+inherited shape list, forgetting the shapes during the fold, and losing the plane folded into
+all produced the right answer anyway. Five *different* shapes over a mask clip kills all three.
+The fourth was the quantisation convention — truncating instead of rounding the coverage byte
+slipped under every tolerance — now pinned by a fixture whose area is exactly half a pixel, so
+the answer must be 128 rather than 127.
+
+The 2 survivors are equivalent, and one corrected a comment rather than the code. `fabs` on the
+shoelace area is redundant: what gets clipped is the *pixel square*, wound counter-clockwise,
+and clipping a convex polygon by half-planes preserves orientation — so a mirrored transform
+cannot flip the sign, and the comment claiming it could was simply wrong. The other is passing
+the canonical matrix rather than the raw one into `raster_image_mapping`, which still
+canonicalises internally; the change is defensive, against someone later deciding the callers
+do it so the callee need not.
 
 ## `probe-linux-swift.sh` — what does the Linux toolchain actually vend?
 
