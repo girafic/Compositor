@@ -190,6 +190,29 @@ bool raster_quad_covered_bounds(const raster_quad *quad, raster_rect *out) {
     return true;
 }
 
+bool raster_quad_touched_bounds(const raster_quad *quad, raster_rect *out) {
+    if (!quad || !out) return false;
+    double xlo = quad->x[0], xhi = quad->x[0], ylo = quad->y[0], yhi = quad->y[0];
+    for (int i = 1; i < 4; ++i) {
+        if (quad->x[i] < xlo) xlo = quad->x[i];
+        if (quad->x[i] > xhi) xhi = quad->x[i];
+        if (quad->y[i] < ylo) ylo = quad->y[i];
+        if (quad->y[i] > yhi) yhi = quad->y[i];
+    }
+    if (!finite_coord(xlo) || !finite_coord(xhi) || !finite_coord(ylo) || !finite_coord(yhi))
+        return false;
+
+    // Positive-area overlap: floor on the near edge, ceil on the far one, matching
+    // raster_device_rect_touched. This is the set an antialiased draw writes, with fractional
+    // coverage on the boundary — the covered set would cut those pixels away before the
+    // coverage could soften them.
+    out->x0 = (int32_t)floor(xlo);
+    out->y0 = (int32_t)floor(ylo);
+    out->x1 = (int32_t)ceil(xhi);
+    out->y1 = (int32_t)ceil(yhi);
+    return out->x1 > out->x0 && out->y1 > out->y0;
+}
+
 // MARK: - Area coverage
 
 #define RASTER_QUAD_MAX_VERTICES 12
@@ -225,9 +248,14 @@ static size_t clip_half_plane(const double *inX, const double *inY, size_t count
     return written;
 }
 
-// Twice the signed area, by the shoelace formula. The sign follows the winding, and a
-// mirrored transform winds the other way — reachable through flipX/flipY on any layer — so
-// callers take the magnitude.
+// Twice the signed area, by the shoelace formula.
+//
+// The sign is always positive here, and for a reason worth recording: what gets clipped is the
+// *pixel square*, wound counter-clockwise, and clipping a convex polygon by half-planes
+// preserves its orientation. So a mirrored transform — flipX, flipY — cannot flip this, because
+// the shape's own winding never enters the calculation. `fabs` at the call site is therefore
+// redundant, confirmed by mutation testing; it stays as the cheapest possible guard against a
+// later change that clips the parallelogram instead.
 static double double_area(const double *x, const double *y, size_t count) {
     double sum = 0.0;
     for (size_t i = 0; i < count; ++i) {

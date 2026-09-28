@@ -106,8 +106,12 @@ bool raster_image_mapping(raster_matrix ctm, raster_frect rect,
         return false;
     if (rect.width == 0.0 || rect.height == 0.0) return false;
 
+    // Canonicalised when it can be, but never refused. The canonicalisation is what keeps a
+    // quarter turn a bit-exact permutation: cos(pi/2) is 6.1e-17, and letting that through
+    // would resample every 90-degree layer a hair off the grid. Everything below is a general
+    // 2x2 composition and inverse, so a rotation or a shear needs no separate path.
     raster_matrix canonical;
-    if (!raster_matrix_is_rectilinear(ctm, rect, &canonical)) return false;
+    if (!raster_matrix_is_rectilinear(ctm, rect, &canonical)) canonical = ctm;
 
     // Source pixel space -> user space. Row 0 lands at the rect's maximum y, which is how
     // CoreGraphics places an image and what the app's own flip then cancels.
@@ -148,10 +152,22 @@ bool raster_image_mapping(raster_matrix ctm, raster_frect rect,
 // How far apart two device pixels land in source pixels, per axis. A value above 1 is a
 // reduction and widens the kernel by exactly that much.
 static void stretches(raster_matrix deviceToImage, double *outU, double *outV) {
-    // A rectilinear inverse has either (b, c) or (a, d) zero, so one device axis feeds each
-    // source axis and the step is the magnitude of whichever term is live.
-    double u = fabs(deviceToImage.a) + fabs(deviceToImage.c);
-    double v = fabs(deviceToImage.b) + fabs(deviceToImage.d);
+    // The L2 norm of each row of the Jacobian. For a rectilinear inverse one term of each pair
+    // is exactly zero, so this is bit-identical to the magnitude of whichever term is live —
+    // which is why generalising it changes nothing on the rectilinear path.
+    //
+    // The L1 norm would be the width of the device pixel's footprint projected onto the source
+    // axis, and for a box footprint that is the defensible answer. It is still the wrong one
+    // here: a pure rotation is an isometry, there is no undersampling to prevent, and L1 widens
+    // the kernel by 41% at 45 degrees — visible blur on every rotated layer at zoom 1. L2
+    // matches the isotropic case, and isotropic is what rotation produces.
+    //
+    // Neither is right for an anisotropic reduction under rotation; that needs an elliptical
+    // (EWA) footprint, which is a separate piece of work. Two oracle assertions hold this
+    // honest: a pure rotation at unit scale must not smear a hard edge, and a rotated
+    // reduction must still average to flat.
+    double u = hypot(deviceToImage.a, deviceToImage.c);
+    double v = hypot(deviceToImage.b, deviceToImage.d);
     *outU = u > 1.0 ? u : 1.0;
     *outV = v > 1.0 ? v : 1.0;
 }

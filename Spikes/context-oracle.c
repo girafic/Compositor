@@ -957,15 +957,16 @@ static void test_context_semantics(void) {
     CHECK(raster_surface_bytes(surface)[0] == 0, "and nothing draws through it", NULL);
     raster_context_restore(ctx);
 
-    // A rotated CTM is refused rather than approximated.
+    // A rotated CTM takes the parallelogram path. Only addRect still refuses: its path storage
+    // is device-space integer rectangles, which cannot hold a sheared quadrilateral.
     raster_context_save(ctx);
     raster_context_set_matrix(ctx, (raster_matrix){ cos(0.4), sin(0.4), -sin(0.4), cos(0.4), 0, 0 });
-    CHECK(raster_context_clip_rect(ctx, (raster_frect){ 0, 0, 4, 4 }) == RASTER_UNSUPPORTED_TRANSFORM,
-          "a rotated clip is refused", NULL);
-    CHECK(raster_context_fill_rect(ctx, (raster_frect){ 0, 0, 4, 4 }) == RASTER_UNSUPPORTED_TRANSFORM,
+    CHECK(raster_context_clip_rect(ctx, (raster_frect){ 0, 0, 4, 4 }) == RASTER_OK,
+          "a rotated clip is accepted", NULL);
+    CHECK(raster_context_fill_rect(ctx, (raster_frect){ 0, 0, 4, 4 }) == RASTER_OK,
           "so is a rotated fill", NULL);
     CHECK(raster_context_add_rect(ctx, (raster_frect){ 0, 0, 4, 4 }) == RASTER_UNSUPPORTED_TRANSFORM,
-          "and a rotated addRect", NULL);
+          "and a rotated addRect still refuses", NULL);
     // A quarter turn is not rotated in this sense and must work.
     raster_context_set_matrix(ctx, (raster_matrix){ cos(M_PI / 2), sin(M_PI / 2),
                                                     -sin(M_PI / 2), cos(M_PI / 2), 10, 0 });
@@ -1640,13 +1641,17 @@ static void test_draw_respects_state(void) {
         CHECK(p[2 * 4 + 3] == 255, "inside it the image is", NULL);
         raster_context_destroy(ctx); raster_surface_release(target);
     }
-    // A rotated CTM is refused, a quarter turn is not.
+    // A rotated CTM draws through the general affine sampler; a quarter turn still takes the
+    // exact integer path.
     {
         raster_surface *target = raster_surface_create(8, 8, RASTER_RGBA8);
         raster_context *ctx = raster_context_create(target);
         raster_context_set_matrix(ctx, (raster_matrix){ cos(0.4), sin(0.4), -sin(0.4), cos(0.4), 0, 0 });
-        CHECK(raster_context_draw_image(ctx, image, (raster_frect){ 0, 0, 4, 4 })
-                  == RASTER_UNSUPPORTED_TRANSFORM, "a rotated image draw is refused", NULL);
+        CHECK(raster_context_draw_image(ctx, image, (raster_frect){ 0, 0, 4, 4 }) == RASTER_OK,
+              "a rotated image draw is accepted", NULL);
+        CHECK(raster_surface_bytes(target)[3] != 0 ||
+              raster_surface_bytes(target)[4 * 4 + 3] != 0,
+              "and it actually painted something", NULL);
         raster_context_set_matrix(ctx, (raster_matrix){ cos(M_PI / 2), sin(M_PI / 2),
                                                         -sin(M_PI / 2), cos(M_PI / 2), 8, 0 });
         CHECK(raster_context_draw_image(ctx, image, (raster_frect){ 0, 0, 4, 4 }) == RASTER_OK,
@@ -2001,11 +2006,13 @@ static void test_mask_clip_refusals(void) {
     CHECK(raster_context_clip_mask(ctx, NULL, all) == RASTER_UNSUPPORTED_FORMAT,
           "so is a missing mask", NULL);
 
-    // A rotation: the app reaches this through LayerRenderer and FolderMaskClip, and it has
-    // to refuse rather than silently clip to an axis-aligned approximation.
+    // A rotation: the app reaches this through LayerRenderer and FolderMaskClip, and it is now
+    // answered rather than refused -- the parallelogram carries the rectangle and the sampled
+    // mask multiplies into it.
     raster_context_set_matrix(ctx, (raster_matrix){ 0.8, 0.6, -0.6, 0.8, 0, 0 });
-    CHECK(raster_context_clip_mask(ctx, gray, all) == RASTER_UNSUPPORTED_TRANSFORM,
-          "a rotated mask clip is refused", NULL);
+    CHECK(raster_context_clip_mask(ctx, gray, all) == RASTER_OK,
+          "a rotated mask clip is accepted", NULL);
+    raster_context_set_matrix(ctx, (raster_matrix){ 1, 0, 0, 1, 0, 0 });
 
     // A quarter turn is rectilinear and must still be accepted.
     raster_context_set_matrix(ctx, (raster_matrix){ 6.1e-17, 1, -1, 6.1e-17, 8, 0 });
@@ -2627,6 +2634,463 @@ static void test_quad_degenerate(void) {
           "a negative extent standardises", NULL);
 }
 
+
+// MARK: - Stage 6: the parallelogram through the context
+
+// A user->device matrix that rotates by `degrees` about (cx, cx).
+static raster_matrix rotation_about(double degrees, double cx) {
+    double r = degrees * M_PI / 180.0, co = cos(r), si = sin(r);
+    return (raster_matrix){ co, si, -si, co,
+                            cx - cx * co + cx * si, cx - cx * si - cx * co };
+}
+
+// A rotated fill against a supersampled reference. The engine walks bands, rows and spans; the
+// reference counts subsamples and knows none of that.
+static void test_rotated_fill_against_reference(void) {
+    for (double degrees = 5.0; degrees < 90.0; degrees += 20.0) {
+        const int n = 24;
+        raster_surface *target = raster_surface_create(n, n, RASTER_GRAY8);
+        raster_context *ctx = raster_context_create(target);
+        raster_matrix m = rotation_about(degrees, n / 2.0);
+        raster_context_set_matrix(ctx, m);
+        raster_context_set_antialias(ctx, true);
+        static const double white[4] = { 1, 1, 1, 1 };
+        raster_context_set_fill_color(ctx, white);
+        raster_frect rect = { 4, 6, 14, 11 };
+        raster_context_fill_rect(ctx, rect);
+
+        raster_quad quad;
+        raster_quad_make(m, rect, &quad);
+        const uint8_t *tp = raster_surface_bytes(target);
+        size_t tstride = raster_surface_stride(target);
+        for (int y = 0; y < n; ++y)
+            for (int x = 0; x < n; ++x) {
+                int hits = 0;
+                for (int sy = 0; sy < 16; ++sy)
+                    for (int sx = 0; sx < 16; ++sx) {
+                        double px = x + (sx + 0.5) / 16.0, py = y + (sy + 0.5) / 16.0;
+                        double u = quad.toUser.a * px + quad.toUser.c * py + quad.toUser.tx;
+                        double v = quad.toUser.b * px + quad.toUser.d * py + quad.toUser.ty;
+                        if (u >= quad.ux0 && u < quad.ux1 && v >= quad.uy0 && v < quad.uy1) ++hits;
+                    }
+                int reference = (int)(hits * 255.0 / 256.0 + 0.5);
+                int got = tp[(size_t)y * tstride + (size_t)x];
+                ++checks;
+                if (abs(got - reference) > 12) {
+                    char buf[180];
+                    snprintf(buf, sizeof buf, "%.0f deg at (%d,%d): painted %d, reference %d",
+                             degrees, x, y, got, reference);
+                    fail("a rotated fill matches a supersampled reference", buf);
+                    y = n; break;
+                }
+            }
+        raster_context_destroy(ctx);
+        raster_surface_release(target);
+    }
+}
+
+// Clipping to a rectangle and filling everything must equal filling that rectangle, when both
+// are hard. That is the invariance the tiled renderer leans on, stated at the context's level.
+static void test_rotated_clip_equals_rotated_fill(void) {
+    for (double degrees = 7.0; degrees < 90.0; degrees += 17.0) {
+        const int n = 24;
+        raster_frect rect = { 3.5, 5.25, 13, 10.5 };
+        raster_matrix m = rotation_about(degrees, n / 2.0);
+        static const double white[4] = { 1, 1, 1, 1 };
+        uint8_t direct[24 * 24], clipped[24 * 24];
+
+        for (int pass = 0; pass < 2; ++pass) {
+            raster_surface *target = raster_surface_create(n, n, RASTER_GRAY8);
+            raster_context *ctx = raster_context_create(target);
+            raster_context_set_matrix(ctx, m);
+            raster_context_set_antialias(ctx, false);
+            raster_context_set_fill_color(ctx, white);
+            if (pass == 0) {
+                raster_context_fill_rect(ctx, rect);
+            } else {
+                raster_context_clip_rect(ctx, rect);
+                raster_context_fill_rect(ctx, (raster_frect){ -100, -100, 400, 400 });
+            }
+            const uint8_t *tp = raster_surface_bytes(target);
+            size_t tstride = raster_surface_stride(target);
+            for (int y = 0; y < n; ++y)
+                memcpy((pass ? clipped : direct) + y * n, tp + (size_t)y * tstride, n);
+            raster_context_destroy(ctx);
+            raster_surface_release(target);
+        }
+        for (int i = 0; i < n * n; ++i) {
+            ++checks;
+            if (direct[i] != clipped[i]) {
+                char buf[180];
+                snprintf(buf, sizeof buf, "%.0f deg at (%d,%d): filled %u, clipped %u",
+                         degrees, i % n, i / n, direct[i], clipped[i]);
+                fail("a hard rotated clip covers the same pixels as the fill", buf);
+                break;
+            }
+        }
+    }
+}
+
+// A rotated clip honours the antialias flag: hard when it is off, area coverage when it is on.
+// The rectilinear path ignores it, and deliberately so -- on integer geometry it is provably
+// invisible -- but a rotated edge is never integer, and a hard clip around an antialiased draw
+// throws the smoothing away again on every masked rotated layer.
+static void test_rotated_clip_honours_antialias(void) {
+    const int n = 20;
+    raster_frect rect = { 3.5, 3.5, 12, 12 };
+    raster_matrix m = rotation_about(30.0, n / 2.0);
+    static const double white[4] = { 1, 1, 1, 1 };
+    uint8_t out[2][20 * 20];
+
+    for (int soft = 0; soft < 2; ++soft) {
+        raster_surface *target = raster_surface_create(n, n, RASTER_GRAY8);
+        raster_context *ctx = raster_context_create(target);
+        raster_context_set_matrix(ctx, m);
+        raster_context_set_antialias(ctx, soft != 0);
+        raster_context_clip_rect(ctx, rect);
+        raster_context_set_antialias(ctx, false);  // the fill's own edge stays out of it
+        raster_context_set_fill_color(ctx, white);
+        raster_context_fill_rect(ctx, (raster_frect){ -100, -100, 400, 400 });
+        const uint8_t *tp = raster_surface_bytes(target);
+        size_t tstride = raster_surface_stride(target);
+        for (int y = 0; y < n; ++y) memcpy(out[soft] + y * n, tp + (size_t)y * tstride, n);
+        raster_context_destroy(ctx);
+        raster_surface_release(target);
+    }
+
+    int hardPartial = 0, softPartial = 0;
+    for (int i = 0; i < n * n; ++i) {
+        if (out[0][i] && out[0][i] != 255) ++hardPartial;
+        if (out[1][i] && out[1][i] != 255) ++softPartial;
+    }
+    CHECK(hardPartial == 0, "antialiasing off gives a rotated clip hard edges", NULL);
+    CHECK(softPartial > 0, "antialiasing on gives it soft ones", NULL);
+}
+
+// Six identical hard rotated clips must leave the same pixels as one. Hard coverage is 0 or
+// 255, so intersecting a shape with itself is idempotent -- which makes this the cheapest way
+// to exercise the fold that runs when nesting outgrows the inline list.
+static void test_rotated_clip_nesting_folds(void) {
+    const int n = 20;
+    raster_frect rect = { 3.5, 4.25, 12, 11 };
+    raster_matrix m = rotation_about(25.0, n / 2.0);
+    static const double white[4] = { 1, 1, 1, 1 };
+    uint8_t out[2][20 * 20];
+
+    for (int pass = 0; pass < 2; ++pass) {
+        raster_surface *target = raster_surface_create(n, n, RASTER_GRAY8);
+        raster_context *ctx = raster_context_create(target);
+        raster_context_set_matrix(ctx, m);
+        raster_context_set_antialias(ctx, false);
+        int depth = pass == 0 ? 1 : 6;
+        for (int i = 0; i < depth; ++i)
+            CHECK(raster_context_clip_rect(ctx, rect) == RASTER_OK, "nesting succeeds", NULL);
+        raster_context_set_fill_color(ctx, white);
+        raster_context_fill_rect(ctx, (raster_frect){ -100, -100, 400, 400 });
+        const uint8_t *tp = raster_surface_bytes(target);
+        size_t tstride = raster_surface_stride(target);
+        for (int y = 0; y < n; ++y) memcpy(out[pass] + y * n, tp + (size_t)y * tstride, n);
+        raster_context_destroy(ctx);
+        raster_surface_release(target);
+    }
+    for (int i = 0; i < n * n; ++i) {
+        ++checks;
+        if (out[0][i] != out[1][i]) {
+            char buf[140];
+            snprintf(buf, sizeof buf, "at (%d,%d): once %u, six times %u",
+                     i % n, i / n, out[0][i], out[1][i]);
+            fail("folding nested rotated clips changes nothing", buf);
+            break;
+        }
+    }
+}
+
+// A singular transform is reachable -- CGAffineTransform.inverted() returns such a matrix
+// unchanged and BrushStroke concatenates the result -- so it has to answer, not trap. Nothing
+// is covered, so nothing draws and the clip becomes empty.
+static void test_singular_transform_draws_nothing(void) {
+    static const raster_matrix singular[] = {
+        { 1, 0.5, 2, 1, 0, 0 },      // rows parallel: determinant zero, not rectilinear
+        { 0, 0, 0, 0, 3, 4 },        // collapses everything to a point
+        { 1, 0, 0, 0, 0, 0 },        // rectilinear by the tolerance, still singular
+    };
+    raster_surface *image = raster_surface_create(4, 4, RASTER_GRAY8);
+    memset(raster_surface_mutable_bytes(image), 255, 4);
+    raster_surface *mask = raster_surface_create(4, 4, RASTER_GRAY8);
+    memset(raster_surface_mutable_bytes(mask), 255, 4);
+
+    for (size_t i = 0; i < sizeof singular / sizeof singular[0]; ++i) {
+        raster_surface *target = raster_surface_create(8, 8, RASTER_GRAY8);
+        raster_context *ctx = raster_context_create(target);
+        raster_context_set_matrix(ctx, singular[i]);
+        static const double white[4] = { 1, 1, 1, 1 };
+        raster_context_set_fill_color(ctx, white);
+        raster_frect all = { 0, 0, 8, 8 };
+        char buf[90];
+        snprintf(buf, sizeof buf, "matrix %zu", i);
+        CHECK(raster_context_fill_rect(ctx, all) == RASTER_OK, "a singular fill is not a refusal", buf);
+        CHECK(raster_context_draw_image(ctx, image, all) == RASTER_OK,
+              "nor is a singular draw", buf);
+        CHECK(raster_context_clip_mask(ctx, mask, all) == RASTER_OK,
+              "nor is a singular mask clip", buf);
+        CHECK(raster_context_clip_rect(ctx, all) == RASTER_OK, "nor is a singular clip", buf);
+
+        const uint8_t *tp = raster_surface_bytes(target);
+        size_t tstride = raster_surface_stride(target);
+        bool blank = true;
+        for (int y = 0; y < 8 && blank; ++y)
+            for (int x = 0; x < 8; ++x)
+                if (tp[(size_t)y * tstride + (size_t)x]) { blank = false; break; }
+        CHECK(blank, "and nothing is painted", buf);
+
+        raster_rect bounds;
+        CHECK(!raster_context_clip_bounds(ctx, &bounds), "and the clip is empty", buf);
+        raster_context_destroy(ctx);
+        raster_surface_release(target);
+    }
+    raster_surface_release(mask);
+    raster_surface_release(image);
+}
+
+// The prefilter width, measured rather than asserted from theory.
+//
+// Both thresholds discriminate against the alternative that was considered and rejected: the L1
+// norm of the Jacobian row, which is the footprint's projection onto the source axis and the
+// textbook answer for a box footprint. Measured, L1 gives 2 to 3 intermediate pixels at unit
+// scale instead of 1, and a reduction spread of 9 at 15 degrees instead of 1 -- which would
+// fail DownsampleTests' own "spread < 6". A pure rotation is an isometry with nothing to
+// prefilter, and L2 is what says so.
+static void test_rotation_does_not_blur(void) {
+    for (double degrees = 15.0; degrees <= 45.0; degrees += 15.0) {
+        const int n = 64;
+        raster_surface *image = raster_surface_create(n, n, RASTER_GRAY8);
+        uint8_t *ip = raster_surface_mutable_bytes(image);
+        size_t istride = raster_surface_stride(image);
+        for (int y = 0; y < n; ++y)
+            for (int x = 0; x < n; ++x) ip[(size_t)y * istride + (size_t)x] = x < n / 2 ? 0 : 255;
+
+        raster_surface *target = raster_surface_create(n, n, RASTER_GRAY8);
+        raster_context *ctx = raster_context_create(target);
+        raster_context_set_matrix(ctx, rotation_about(degrees, n / 2.0));
+        raster_context_set_interpolation(ctx, RASTER_INTERPOLATION_LOW);
+        raster_context_set_blend(ctx, RASTER_BLEND_COPY);
+        raster_context_draw_image(ctx, image, (raster_frect){ 0, 0, n, n });
+
+        const uint8_t *tp = raster_surface_bytes(target);
+        size_t tstride = raster_surface_stride(target);
+        int widest = 0, run = 0;
+        for (int x = 0; x < n; ++x) {
+            uint8_t v = tp[(size_t)(n / 2) * tstride + (size_t)x];
+            if (v > 4 && v < 251) { ++run; if (run > widest) widest = run; } else run = 0;
+        }
+        char buf[140];
+        snprintf(buf, sizeof buf, "%.0f deg: %d intermediate pixels across the edge", degrees, widest);
+        CHECK(widest <= 1, "a rotation at unit scale does not smear a hard edge", buf);
+
+        raster_context_destroy(ctx);
+        raster_surface_release(target);
+        raster_surface_release(image);
+    }
+}
+
+static void test_rotated_reduction_does_not_alias(void) {
+    for (double degrees = 15.0; degrees <= 45.0; degrees += 15.0) {
+        const int n = 128, out = 32;
+        raster_surface *image = raster_surface_create(n, n, RASTER_GRAY8);
+        uint8_t *ip = raster_surface_mutable_bytes(image);
+        size_t istride = raster_surface_stride(image);
+        for (int y = 0; y < n; ++y)
+            for (int x = 0; x < n; ++x) ip[(size_t)y * istride + (size_t)x] = (x & 1) ? 255 : 0;
+
+        raster_surface *target = raster_surface_create(out, out, RASTER_GRAY8);
+        raster_context *ctx = raster_context_create(target);
+        raster_context_set_matrix(ctx, rotation_about(degrees, out / 2.0));
+        raster_context_set_interpolation(ctx, RASTER_INTERPOLATION_LOW);
+        raster_context_set_blend(ctx, RASTER_BLEND_COPY);
+        raster_context_draw_image(ctx, image, (raster_frect){ 0, 0, out, out });
+
+        const uint8_t *tp = raster_surface_bytes(target);
+        size_t tstride = raster_surface_stride(target);
+        double sum = 0; int count = 0; int lo = 255, hi = 0;
+        for (int y = out / 4; y < out * 3 / 4; ++y)
+            for (int x = out / 4; x < out * 3 / 4; ++x) {
+                int v = tp[(size_t)y * tstride + (size_t)x];
+                sum += v; ++count;
+                if (v < lo) lo = v;
+                if (v > hi) hi = v;
+            }
+        char buf[160];
+        snprintf(buf, sizeof buf, "%.0f deg: mean %.2f, spread %d", degrees, sum / count, hi - lo);
+        CHECK(fabs(sum / count - 127.5) < 4.0, "a rotated reduction averages to flat grey", buf);
+        CHECK(hi - lo <= 2, "and does not shimmer", buf);
+
+        raster_context_destroy(ctx);
+        raster_surface_release(target);
+        raster_surface_release(image);
+    }
+}
+
+// A quarter turn must stay a bit-exact permutation. This is what the canonicalisation inside
+// raster_image_mapping buys, and it is why the rectilinear selector was kept rather than
+// deleted once the sampler went general.
+static void test_quarter_turn_is_exact(void) {
+    const int n = 4;
+    raster_surface *image = raster_surface_create(n, n, RASTER_GRAY8);
+    uint8_t *ip = raster_surface_mutable_bytes(image);
+    size_t istride = raster_surface_stride(image);
+    for (int y = 0; y < n; ++y)
+        for (int x = 0; x < n; ++x)
+            ip[(size_t)y * istride + (size_t)x] = (uint8_t)(17 + x * 40 + y * 7);
+
+    raster_surface *target = raster_surface_create(n, n, RASTER_GRAY8);
+    raster_context *ctx = raster_context_create(target);
+    raster_context_set_matrix(ctx, rotation_about(90.0, n / 2.0));
+    raster_context_set_interpolation(ctx, RASTER_INTERPOLATION_NONE);
+    raster_context_set_blend(ctx, RASTER_BLEND_COPY);
+    raster_context_set_antialias(ctx, false);
+    raster_context_draw_image(ctx, image, (raster_frect){ 0, 0, n, n });
+
+    // Every source value appears exactly once: no interpolated intermediates, nothing lost.
+    int seen[256] = { 0 };
+    const uint8_t *tp = raster_surface_bytes(target);
+    size_t tstride = raster_surface_stride(target);
+    for (int y = 0; y < n; ++y)
+        for (int x = 0; x < n; ++x) ++seen[tp[(size_t)y * tstride + (size_t)x]];
+    bool permutation = true;
+    for (int y = 0; y < n && permutation; ++y)
+        for (int x = 0; x < n; ++x)
+            if (--seen[ip[(size_t)y * istride + (size_t)x]] < 0) { permutation = false; break; }
+    CHECK(permutation, "a quarter turn is an exact permutation of the source", NULL);
+
+    raster_context_destroy(ctx);
+    raster_surface_release(target);
+    raster_surface_release(image);
+}
+
+// Shear, not just rotation. ImageResizer puts a non-uniform scale outside LayerRenderer's
+// rotation and says so in its own comment, so this is a real transform rather than a
+// completeness exercise.
+static void test_shear_draws_and_clips(void) {
+    const int n = 20;
+    raster_matrix shear = { 1, 0, 0.5, 1, 0, 0 };
+    raster_surface *image = raster_surface_create(8, 8, RASTER_GRAY8);
+    uint8_t *ip = raster_surface_mutable_bytes(image);
+    size_t istride = raster_surface_stride(image);
+    for (int y = 0; y < 8; ++y) memset(ip + (size_t)y * istride, 200, 8);
+
+    raster_surface *target = raster_surface_create(n, n, RASTER_GRAY8);
+    raster_context *ctx = raster_context_create(target);
+    raster_context_set_matrix(ctx, shear);
+    raster_context_set_interpolation(ctx, RASTER_INTERPOLATION_NONE);
+    raster_context_set_blend(ctx, RASTER_BLEND_COPY);
+    raster_context_set_antialias(ctx, false);
+    CHECK(raster_context_draw_image(ctx, image, (raster_frect){ 2, 2, 8, 8 }) == RASTER_OK,
+          "a sheared draw is accepted", NULL);
+
+    // The shape is a parallelogram, so a row inside it is offset from the row above by the
+    // shear. Checking that the painted run moves proves the shear reached the geometry rather
+    // than being flattened to a bounding box.
+    const uint8_t *tp = raster_surface_bytes(target);
+    size_t tstride = raster_surface_stride(target);
+    int firstAt3 = -1, firstAt7 = -1;
+    for (int x = 0; x < n; ++x) {
+        if (firstAt3 < 0 && tp[3 * tstride + (size_t)x]) firstAt3 = x;
+        if (firstAt7 < 0 && tp[7 * tstride + (size_t)x]) firstAt7 = x;
+    }
+    char buf[140];
+    snprintf(buf, sizeof buf, "row 3 starts at %d, row 7 at %d", firstAt3, firstAt7);
+    CHECK(firstAt3 >= 0 && firstAt7 > firstAt3, "and the shear moves each row along", buf);
+
+    raster_context_destroy(ctx);
+    raster_surface_release(target);
+    raster_surface_release(image);
+}
+
+
+// An area the geometry fixes exactly, so the quantisation convention is pinned rather than
+// merely bounded by a tolerance.
+//
+// The transform sends device (x, y) to user (x - y, y), so the edge u = 0 is the 45-degree line
+// through the origin and pixel (0,0) is cut exactly in half: area 1/2, which rounds to 128 and
+// truncates to 127. Rounding is what raster_axis_coverage and the blend code do, so the
+// parallelogram has to agree or the two paths differ by one at the selector boundary.
+static void test_quad_area_is_rounded(void) {
+    raster_matrix m = { 1, 0, 1, 1, 0, 0 };   // inverse of (x, y) -> (x - y, y)
+    raster_quad quad;
+    CHECK(raster_quad_make(m, (raster_frect){ 0, -100, 100, 200 }, &quad),
+          "the half-covered fixture builds", NULL);
+    uint8_t coverage[1];
+    raster_quad_coverage_row(&quad, 0, 0, 1, coverage);
+    char buf[120];
+    snprintf(buf, sizeof buf, "exactly half a pixel read %u, expected 128", coverage[0]);
+    CHECK(coverage[0] == 128, "half coverage rounds up, as every other path does", buf);
+}
+
+// Nested rotated clips, all *different*, under a mask clip, deep enough to force the fold.
+//
+// Identical shapes cannot test any of this: intersecting a shape with itself is idempotent, so
+// dropping the inherited list, or forgetting the shapes during the fold, or losing the plane it
+// folds into, all give the same answer. Mutation testing found exactly that -- three separate
+// defects survived a six-deep nest of one shape.
+static void test_nested_rotated_clips_compose(void) {
+    const int n = 28;
+    static const double angles[5] = { 11.0, 29.0, 47.0, 66.0, 83.0 };
+    raster_frect rect = { 5, 6, 18, 16 };
+
+    raster_surface *mask = raster_surface_create(n, n, RASTER_GRAY8);
+    uint8_t *mp = raster_surface_mutable_bytes(mask);
+    size_t mstride = raster_surface_stride(mask);
+    for (int y = 0; y < n; ++y) memset(mp + (size_t)y * mstride, 200, n);
+
+    raster_surface *target = raster_surface_create(n, n, RASTER_GRAY8);
+    raster_context *ctx = raster_context_create(target);
+    install_identity(ctx);
+    raster_context_set_antialias(ctx, false);
+    raster_context_set_interpolation(ctx, RASTER_INTERPOLATION_NONE);
+
+    // The plane first, so the fold has something to preserve.
+    CHECK(raster_context_clip_mask(ctx, mask, (raster_frect){ 0, 0, n, n }) == RASTER_OK,
+          "the mask clip beneath the nest is accepted", NULL);
+
+    raster_quad quads[5];
+    for (int i = 0; i < 5; ++i) {
+        raster_matrix m = rotation_about(angles[i], n / 2.0);
+        CHECK(raster_quad_make(m, rect, &quads[i]), "each shape builds", NULL);
+        raster_context_set_matrix(ctx, m);
+        CHECK(raster_context_clip_rect(ctx, rect) == RASTER_OK, "and clips", NULL);
+    }
+
+    install_identity(ctx);
+    static const double white[4] = { 1, 1, 1, 1 };
+    raster_context_set_fill_color(ctx, white);
+    raster_context_fill_rect(ctx, (raster_frect){ 0, 0, n, n });
+
+    const uint8_t *tp = raster_surface_bytes(target);
+    size_t tstride = raster_surface_stride(target);
+    for (int y = 0; y < n; ++y)
+        for (int x = 0; x < n; ++x) {
+            // Composed in the test rather than in the clip: every shape must contain the pixel.
+            bool inside = true;
+            for (int i = 0; i < 5 && inside; ++i) {
+                int32_t a, b;
+                if (!raster_quad_row_span(&quads[i], y, &a, &b) || x < a || x >= b) inside = false;
+            }
+            uint8_t want = inside ? 200 : 0;
+            uint8_t got = tp[(size_t)y * tstride + (size_t)x];
+            ++checks;
+            if (got != want) {
+                char buf[160];
+                snprintf(buf, sizeof buf, "at (%d,%d): got %u, expected %u", x, y, got, want);
+                fail("five different rotated clips compose, over a mask clip", buf);
+                y = n; break;
+            }
+        }
+
+    raster_context_destroy(ctx);
+    raster_surface_release(target);
+    raster_surface_release(mask);
+}
+
 int main(void) {
     test_pixel_edge_definition();
     test_partition();
@@ -2676,6 +3140,18 @@ int main(void) {
     test_quad_agrees_with_rectilinear();
     test_quad_covered_bounds();
     test_quad_degenerate();
+
+    test_rotated_fill_against_reference();
+    test_rotated_clip_equals_rotated_fill();
+    test_rotated_clip_honours_antialias();
+    test_rotated_clip_nesting_folds();
+    test_singular_transform_draws_nothing();
+    test_rotation_does_not_blur();
+    test_rotated_reduction_does_not_alias();
+    test_quarter_turn_is_exact();
+    test_shear_draws_and_clips();
+    test_quad_area_is_rounded();
+    test_nested_rotated_clips_compose();
 
     fprintf(stderr, "%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;

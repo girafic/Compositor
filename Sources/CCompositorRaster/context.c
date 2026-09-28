@@ -23,6 +23,11 @@
 
 // MARK: - Clips
 
+// How many parallelogram clips ride along before they are folded into a plane. Four covers
+// what the app nests — a layer's own mask inside a folder mask inside a tile clip — and the
+// overflow path is correct rather than merely unlikely.
+#define RASTER_CLIP_MAX_QUADS 4
+
 typedef struct raster_clip {
     size_t refcount;
     raster_region *region;     // never NULL
@@ -31,6 +36,15 @@ typedef struct raster_clip {
     // Tying it to the bounds rather than giving it its own origin removes a whole class of
     // off-by-one: there is no second coordinate system to keep in step.
     raster_surface *coverage;
+
+    // Clips taken under a transform that is not rectilinear. Carried as shapes and evaluated
+    // per row, not rasterised, because BrushStroke clips inside its per-dab loop — roughly 14
+    // dabs per mouse move — and a plane there would be a multi-megabyte calloc per dab on the
+    // one path with a performance document to its name. `soft` records whether each was taken
+    // with antialiasing on, which decides area coverage versus a hard span.
+    raster_quad quads[RASTER_CLIP_MAX_QUADS];
+    bool soft[RASTER_CLIP_MAX_QUADS];
+    size_t quadCount;
 } raster_clip;
 
 // Takes ownership of `region`, and of one reference to `coverage` (which may be NULL).
@@ -39,7 +53,7 @@ static raster_clip *clip_create(raster_region *region, raster_surface *coverage)
         raster_surface_release(coverage);
         return NULL;
     }
-    raster_clip *clip = malloc(sizeof(raster_clip));
+    raster_clip *clip = calloc(1, sizeof(raster_clip));
     if (!clip) {
         raster_region_destroy(region);
         raster_surface_release(coverage);
@@ -49,6 +63,86 @@ static raster_clip *clip_create(raster_region *region, raster_surface *coverage)
     clip->region = region;
     clip->coverage = coverage;
     return clip;
+}
+
+// Copies `from`'s parallelograms into `clip`. They are plain values, so a clip that inherits
+// them shares nothing and a restoreGState needs no undoing.
+static void clip_inherit_quads(raster_clip *clip, const raster_clip *from) {
+    for (size_t i = 0; i < from->quadCount; ++i) {
+        clip->quads[i] = from->quads[i];
+        clip->soft[i] = from->soft[i];
+    }
+    clip->quadCount = from->quadCount;
+}
+
+// One row of a parallelogram's contribution: area coverage when it was taken with antialiasing
+// on, a hard span otherwise. `out` receives `count` bytes.
+static void quad_row(const raster_quad *quad, bool soft, int32_t x0, int32_t y, size_t count,
+                     uint8_t *out) {
+    if (soft) {
+        raster_quad_coverage_row(quad, x0, y, count, out);
+        return;
+    }
+    int32_t a, b;
+    if (!raster_quad_row_span(quad, y, &a, &b)) {
+        memset(out, 0, count);
+        return;
+    }
+    for (size_t x = 0; x < count; ++x) {
+        int32_t column = x0 + (int32_t)x;
+        out[x] = (column >= a && column < b) ? 255 : 0;
+    }
+}
+
+// Rasterises the clip's parallelograms into its plane and empties the list.
+//
+// Only reached when nesting runs past the inline list. Everything else evaluates the shapes per
+// row, which is the point of carrying them; this exists so that depth is a cost rather than a
+// limit.
+static bool clip_fold_quads(raster_clip *clip) {
+    if (!clip->quadCount) return true;
+
+    raster_rect bounds = raster_region_bounds(clip->region);
+    if (bounds.x1 <= bounds.x0 || bounds.y1 <= bounds.y0) {
+        clip->quadCount = 0;
+        return true;
+    }
+    size_t width = (size_t)(bounds.x1 - bounds.x0), height = (size_t)(bounds.y1 - bounds.y0);
+
+    // A fresh plane, never a write through the existing one: that may be a crop view sharing
+    // an outer clip's store, and writing through it would change what a restoreGState returns
+    // to.
+    raster_surface *plane = raster_surface_create(width, height, RASTER_GRAY8);
+    uint8_t *bytes = plane ? raster_surface_mutable_bytes(plane) : NULL;
+    uint8_t *temp = bytes ? malloc(width) : NULL;
+    if (!bytes || !temp) {
+        free(temp);
+        raster_surface_release(plane);
+        return false;
+    }
+    size_t stride = raster_surface_stride(plane);
+
+    const raster_surface *existing = clip->coverage;
+    const uint8_t *old = existing ? raster_surface_bytes(existing) : NULL;
+    size_t oldStride = existing ? raster_surface_stride(existing) : 0;
+
+    for (size_t row = 0; row < height; ++row) {
+        int32_t y = bounds.y0 + (int32_t)row;
+        uint8_t *dst = bytes + row * stride;
+        if (old) memcpy(dst, old + row * oldStride, width);
+        else memset(dst, 255, width);
+        for (size_t i = 0; i < clip->quadCount; ++i) {
+            quad_row(&clip->quads[i], clip->soft[i], bounds.x0, y, width, temp);
+            for (size_t x = 0; x < width; ++x)
+                dst[x] = (uint8_t)((dst[x] * temp[x] + 127) / 255);
+        }
+    }
+
+    free(temp);
+    raster_surface_release(clip->coverage);
+    clip->coverage = plane;
+    clip->quadCount = 0;
+    return true;
 }
 
 static raster_clip *clip_retain(raster_clip *clip) {
@@ -278,6 +372,64 @@ static raster_status clip_intersect(raster_context *ctx, raster_region *region) 
 
     raster_clip *clip = clip_create(narrowed, coverage);
     if (!clip) return RASTER_OUT_OF_MEMORY;
+    clip_inherit_quads(clip, ctx->state.clip);
+    clip_release(ctx->state.clip);
+    ctx->state.clip = clip;
+    return RASTER_OK;
+}
+
+// Replaces the clip with its intersection with `quad`. The shape rides along in the clip
+// rather than being rasterised; only an overflow of the inline list forces a plane.
+static raster_status clip_intersect_quad(raster_context *ctx, const raster_quad *quad, bool soft) {
+    raster_rect covered;
+    // The exact bounds of the covered pixel set, not the geometry rounded out. A sliver too
+    // thin to contain a pixel centre reports nothing here, and the clip has to collapse to
+    // empty for it — otherwise boundingBoxOfClipPath answers with a rectangle where Swift owes
+    // CGRect.null, and TiledLayerRenderer's -64 inset turns that into nonsense.
+    //
+    // For an antialiased clip the *touched* set is what gets partial coverage, so the bounds
+    // have to be the wider ones or the boundary pixels are cut away before the coverage can
+    // soften them.
+    bool any = soft ? raster_quad_touched_bounds(quad, &covered)
+                    : raster_quad_covered_bounds(quad, &covered);
+    if (!any) {
+        raster_region *nothing = raster_region_create();
+        if (!nothing) return RASTER_OUT_OF_MEMORY;
+        raster_clip *empty = clip_create(nothing, NULL);
+        if (!empty) return RASTER_OUT_OF_MEMORY;
+        clip_release(ctx->state.clip);
+        ctx->state.clip = empty;
+        return RASTER_OK;
+    }
+
+    raster_region *piece = raster_region_create_rect(covered);
+    if (!piece) return RASTER_OUT_OF_MEMORY;
+    raster_region *narrowed = raster_region_intersect(ctx->state.clip->region, piece);
+    raster_region_destroy(piece);
+    if (!narrowed) return RASTER_OUT_OF_MEMORY;
+
+    raster_surface *coverage;
+    if (!coverage_rebase(ctx->state.clip, raster_region_bounds(narrowed), &coverage)) {
+        raster_region_destroy(narrowed);
+        return RASTER_OUT_OF_MEMORY;
+    }
+
+    raster_clip *clip = clip_create(narrowed, coverage);
+    if (!clip) return RASTER_OUT_OF_MEMORY;
+    clip_inherit_quads(clip, ctx->state.clip);
+
+    if (clip->quadCount == RASTER_CLIP_MAX_QUADS) {
+        // Deeper nesting than the inline list holds. Fold what is there into a plane once, so
+        // the list has room again; correctness does not depend on this never happening.
+        if (!clip_fold_quads(clip)) {
+            clip_release(clip);
+            return RASTER_OUT_OF_MEMORY;
+        }
+    }
+    clip->quads[clip->quadCount] = *quad;
+    clip->soft[clip->quadCount] = soft;
+    ++clip->quadCount;
+
     clip_release(ctx->state.clip);
     ctx->state.clip = clip;
     return RASTER_OK;
@@ -310,8 +462,17 @@ raster_status raster_context_clip_path(raster_context *ctx, bool even_odd) {
 raster_status raster_context_clip_rect(raster_context *ctx, raster_frect rect) {
     if (!ctx) return RASTER_OK;
     raster_matrix canonical;
-    if (!raster_matrix_is_rectilinear(ctx->state.ctm, rect, &canonical))
-        return RASTER_UNSUPPORTED_TRANSFORM;
+    if (!raster_matrix_is_rectilinear(ctx->state.ctm, rect, &canonical)) {
+        raster_quad quad;
+        if (!raster_quad_make(ctx->state.ctm, rect, &quad)) {
+            // Degenerate or singular: nothing is covered, so the clip becomes empty. Not a
+            // refusal — CGAffineTransform.inverted() hands back a singular matrix unchanged and
+            // BrushStroke concatenates the result, so this is reachable and has to answer.
+            raster_region *nothing = raster_region_create();
+            return clip_intersect(ctx, nothing);
+        }
+        return clip_intersect_quad(ctx, &quad, ctx->state.antialias);
+    }
 
     raster_rect device;
     if (!raster_device_rect_covered(canonical, rect, &device)) {
@@ -328,81 +489,78 @@ raster_status raster_context_clip_mask(raster_context *ctx, const raster_surface
     if (!ctx) return RASTER_OK;
     if (!mask || raster_surface_format(mask) != RASTER_GRAY8) return RASTER_UNSUPPORTED_FORMAT;
 
-    // Redundant on its own: raster_image_mapping below repeats this test and would refuse a
-    // rotation anyway, so removing this survives every test. It stays because it makes the
-    // refusal this function's own decision rather than a side effect of what a callee happens
-    // to check, and because the canonical matrix is wanted regardless.
+    // Not a gate any more, a selector. A rectilinear transform gets the canonical matrix --
+    // still worth having, because that canonicalisation is what keeps a quarter-turned mask a
+    // bit-exact permutation rather than a resample 6.1e-17 off the grid -- and anything else
+    // passes through as it is, because the sampler is general affine.
     raster_matrix canonical;
-    if (!raster_matrix_is_rectilinear(ctx->state.ctm, rect, &canonical))
-        return RASTER_UNSUPPORTED_TRANSFORM;
+    bool rectilinear = raster_matrix_is_rectilinear(ctx->state.ctm, rect, &canonical);
+    if (!rectilinear) canonical = ctx->state.ctm;
 
-    // The rectangle clips hard, by the same centre rule as every other clip. Softness comes
-    // from the mask's own values and from nowhere else.
-    //
-    // This has to come *before* the mapping. An empty rectangle is a legitimate way to clip
-    // everything away -- Selection builds one for an empty marquee, and clip_rect already
-    // defines it that way -- but raster_image_mapping refuses a degenerate rectangle, and
-    // treating that refusal as an unsupported transform turns a valid request into a trap.
-    raster_rect device;
-    if (!raster_device_rect_covered(canonical, rect, &device)) {
-        raster_region *nothing = raster_region_create();
-        return clip_intersect(ctx, nothing);
-    }
-
+    // The mapping is computed before anything is narrowed, so its one failure mode cannot
+    // leave the clip half-applied. It fails on a degenerate rectangle or a singular transform,
+    // both of which mean nothing is covered -- fail closed, never open.
     raster_matrix deviceToMask;
     if (!raster_image_mapping(canonical, rect, raster_surface_width(mask),
                               raster_surface_height(mask), &deviceToMask))
-        return RASTER_UNSUPPORTED_TRANSFORM;
+        return clip_intersect(ctx, raster_region_create());
 
-    raster_region *piece = raster_region_create_rect(device);
-    if (!piece) return RASTER_OUT_OF_MEMORY;
-    raster_region *narrowed = raster_region_intersect(ctx->state.clip->region, piece);
-    raster_region_destroy(piece);
-    if (!narrowed) return RASTER_OUT_OF_MEMORY;
-
-    raster_rect bounds = raster_region_bounds(narrowed);
-    if (raster_region_is_empty(narrowed)) {
-        raster_clip *empty = clip_create(narrowed, NULL);
-        if (!empty) return RASTER_OUT_OF_MEMORY;
-        clip_release(ctx->state.clip);
-        ctx->state.clip = empty;
-        return RASTER_OK;
+    // Narrow to the rectangle first, then sample the mask over what is left. Splitting it this
+    // way keeps the shape's edge rule in one place and means the plane is only ever built over
+    // a region already cut down to the shape.
+    raster_status status;
+    if (rectilinear) {
+        // The rectangle clips hard, by the same centre rule as every other clip. Softness comes
+        // from the mask's own values and from nowhere else.
+        raster_rect device;
+        if (!raster_device_rect_covered(canonical, rect, &device))
+            return clip_intersect(ctx, raster_region_create());
+        status = clip_intersect(ctx, raster_region_create_rect(device));
+    } else {
+        raster_quad quad;
+        if (!raster_quad_make(canonical, rect, &quad))
+            return clip_intersect(ctx, raster_region_create());
+        status = clip_intersect_quad(ctx, &quad, ctx->state.antialias);
     }
+    if (status != RASTER_OK) return status;
 
+    // Whichever branch ran, it built a fresh clip and handed it straight to the state, so this
+    // one holds the only reference and can be finished in place. Anything a saveGState is
+    // holding points at the clip that was just released.
+    raster_clip *clip = ctx->state.clip;
+    if (raster_region_is_empty(clip->region)) return RASTER_OK;
+
+    raster_rect bounds = raster_region_bounds(clip->region);
     size_t width = (size_t)(bounds.x1 - bounds.x0), height = (size_t)(bounds.y1 - bounds.y0);
     raster_surface *plane = raster_surface_create(width, height, RASTER_GRAY8);
     uint8_t *planeBytes = plane ? raster_surface_mutable_bytes(plane) : NULL;
     if (!planeBytes) {
         raster_surface_release(plane);
-        raster_region_destroy(narrowed);
         return RASTER_OUT_OF_MEMORY;
     }
     size_t planeStride = raster_surface_stride(plane);
 
-    // The parent's plane is read, never written. That is the whole of the copy-on-write
-    // story: a nested clip builds its own plane, so a restoreGState finds the outer one
-    // exactly as it left it, with no versioning and no copy on the way in.
-    const raster_surface *parent = ctx->state.clip->coverage;
-    const uint8_t *parentBytes = parent ? raster_surface_bytes(parent) : NULL;
-    size_t parentStride = parent ? raster_surface_stride(parent) : 0;
-    raster_rect parentBounds = raster_region_bounds(ctx->state.clip->region);
+    // The existing plane is read, never written. That is the whole of the copy-on-write story:
+    // a nested clip builds its own, so a restoreGState finds the outer one exactly as it left
+    // it, with no versioning and no copy on the way in. It may be a crop view sharing an outer
+    // clip's store, which is precisely why writing through it would be wrong.
+    const raster_surface *existing = clip->coverage;
+    const uint8_t *existingBytes = existing ? raster_surface_bytes(existing) : NULL;
+    size_t existingStride = existing ? raster_surface_stride(existing) : 0;
 
     raster_interpolation quality = ctx->state.interpolation;
     for (size_t row = 0; row < height; ++row) {
         int32_t y = bounds.y0 + (int32_t)row;
         uint8_t *dst = planeBytes + row * planeStride;
         raster_sample_row(mask, deviceToMask, bounds.x0, y, width, quality, dst);
-        if (!parentBytes) continue;
-        const uint8_t *src = parentBytes + (size_t)(y - parentBounds.y0) * parentStride
-                           + (size_t)(bounds.x0 - parentBounds.x0);
+        if (!existingBytes) continue;
+        const uint8_t *src = existingBytes + row * existingStride;
         for (size_t x = 0; x < width; ++x)
             dst[x] = (uint8_t)((dst[x] * src[x] + 127) / 255);
     }
 
-    raster_clip *clip = clip_create(narrowed, plane);
-    if (!clip) return RASTER_OUT_OF_MEMORY;
-    clip_release(ctx->state.clip);
-    ctx->state.clip = clip;
+    raster_surface_release(clip->coverage);
+    clip->coverage = plane;
     return RASTER_OK;
 }
 
@@ -524,22 +682,58 @@ static const uint8_t *plane_apply(const coverage_plane *plane, uint8_t *scratch,
     return scratch;
 }
 
+// The clip's whole contribution to one row: its plane, then each parallelogram it carries.
+// `coverage` is what the shape being painted produced, or NULL for "fully covered", and the
+// answer is the same thing with the clip multiplied in.
+//
+// `scratch` and `temp` are separate rows of at least `count` bytes. `scratch` may alias
+// `coverage`, which stays safe because every output depends only on the input at the same
+// index; `temp` may not, because it is written whole before it is read.
+static const uint8_t *clip_apply(const raster_clip *clip, const coverage_plane *plane,
+                                 uint8_t *scratch, uint8_t *temp, const uint8_t *coverage,
+                                 int32_t x0, int32_t y, size_t count) {
+    coverage = plane_apply(plane, scratch, coverage, x0, y, count);
+    for (size_t i = 0; i < clip->quadCount; ++i) {
+        quad_row(&clip->quads[i], clip->soft[i], x0, y, count, temp);
+        if (!coverage) {
+            memcpy(scratch, temp, count);
+        } else {
+            for (size_t x = 0; x < count; ++x)
+                scratch[x] = (uint8_t)((coverage[x] * temp[x] + 127) / 255);
+        }
+        coverage = scratch;
+    }
+    return coverage;
+}
+
 // One fill, shared by fill_rect and clear_rect. `blend` and `alpha` are passed in rather
 // than read from the state because clear ignores both of the state's.
 static raster_status paint(raster_context *ctx, raster_frect rect, raster_blend blend,
                            double alpha, const double fill[4]) {
+    // A selector, not a gate. A rectilinear transform keeps the exact integer path unchanged,
+    // which is what leaves the existing million-check oracle untouched; anything else -- a
+    // rotation, a shear, or both -- goes through the parallelogram.
     raster_matrix canonical;
-    if (!raster_matrix_is_rectilinear(ctx->state.ctm, rect, &canonical))
-        return RASTER_UNSUPPORTED_TRANSFORM;
+    bool rectilinear = raster_matrix_is_rectilinear(ctx->state.ctm, rect, &canonical);
+    bool antialias = ctx->state.antialias;
 
     double box[4];
-    if (!raster_device_box(canonical, rect, box)) return RASTER_OK;  // empty, not an error
-
-    bool antialias = ctx->state.antialias;
+    raster_quad quad;
     raster_rect area;
-    bool any = antialias ? raster_device_rect_touched(canonical, rect, &area)
-                         : raster_device_rect_covered(canonical, rect, &area);
-    if (!any) return RASTER_OK;
+    if (rectilinear) {
+        if (!raster_device_box(canonical, rect, box)) return RASTER_OK;  // empty, not an error
+        bool any = antialias ? raster_device_rect_touched(canonical, rect, &area)
+                             : raster_device_rect_covered(canonical, rect, &area);
+        if (!any) return RASTER_OK;
+    } else {
+        // A degenerate rectangle or a singular transform covers nothing. That is an answer,
+        // not a failure: CGAffineTransform.inverted() returns a singular matrix unchanged and
+        // BrushStroke concatenates the result.
+        if (!raster_quad_make(ctx->state.ctm, rect, &quad)) return RASTER_OK;
+        bool any = antialias ? raster_quad_touched_bounds(&quad, &area)
+                             : raster_quad_covered_bounds(&quad, &area);
+        if (!any) return RASTER_OK;
+    }
 
     raster_status status = raster_context_detach_snapshots(ctx);
     if (status != RASTER_OK) return status;
@@ -566,17 +760,24 @@ static raster_status paint(raster_context *ctx, raster_frect rect, raster_blend 
     }
     uint8_t alpha8 = quantise(weight);
 
+    // Three rows: the column profile (rectilinear only), the row being combined, and a
+    // temporary for one shape's contribution. Reserved unconditionally, because the quad path
+    // needs the last two whether or not there is a plane, and getting this wrong is a heap
+    // overflow the oracle cannot see.
     int32_t width = area.x1 - area.x0;
+    if (!scratch_reserve(ctx, (size_t)width * 3)) return RASTER_OUT_OF_MEMORY;
+    uint8_t *combined = ctx->scratch + width;
+    uint8_t *temp = ctx->scratch + (size_t)width * 2;
+
     const uint8_t *columnCoverage = NULL;
-    if (antialias) {
-        if (!scratch_reserve(ctx, (size_t)width * 2)) return RASTER_OUT_OF_MEMORY;
+    if (rectilinear && antialias) {
         raster_axis_coverage(box[0], box[2], area.x0, area.x1, ctx->scratch);
         columnCoverage = ctx->scratch;
     }
 
-    const raster_region *clip = ctx->state.clip->region;
-    coverage_plane plane = clip_plane(ctx->state.clip);
-    if (plane.bytes && !scratch_reserve(ctx, (size_t)width * 2)) return RASTER_OUT_OF_MEMORY;
+    const raster_clip *state = ctx->state.clip;
+    const raster_region *clip = state->region;
+    coverage_plane plane = clip_plane(state);
 
     size_t clipCount = raster_region_count(clip);
     for (size_t i = 0; i < clipCount; ++i) {
@@ -587,10 +788,28 @@ static raster_status paint(raster_context *ctx, raster_frect rect, raster_blend 
         };
         if (raster_rect_is_empty(hit)) continue;
 
-        size_t count = (size_t)(hit.x1 - hit.x0);
         for (int32_t y = hit.y0; y < hit.y1; ++y) {
+            int32_t rowX0 = hit.x0;
+            size_t count = (size_t)(hit.x1 - hit.x0);
             const uint8_t *coverage = NULL;
-            if (antialias) {
+
+            if (!rectilinear) {
+                if (antialias) {
+                    raster_quad_coverage_row(&quad, rowX0, y, count, combined);
+                    coverage = combined;
+                } else {
+                    // Hard edges: narrow the row to the span instead of carrying zeroes
+                    // through the blend. The narrowing happens *after* the intersection with
+                    // the clip band, which is what keeps plane_apply inside its buffer.
+                    int32_t spanLo, spanHi;
+                    if (!raster_quad_row_span(&quad, y, &spanLo, &spanHi)) continue;
+                    if (spanLo < rowX0) spanLo = rowX0;
+                    if (spanHi > hit.x1) spanHi = hit.x1;
+                    if (spanHi <= spanLo) continue;
+                    rowX0 = spanLo;
+                    count = (size_t)(spanHi - spanLo);
+                }
+            } else if (antialias) {
                 uint8_t row;
                 raster_axis_coverage(box[1], box[3], y, y + 1, &row);
                 if (row == 0) continue;
@@ -600,14 +819,14 @@ static raster_status paint(raster_context *ctx, raster_frect rect, raster_blend 
                 } else {
                     // Only the top and bottom rows of an antialiased fill are partial, so
                     // this scratch pass runs at most twice per fill.
-                    uint8_t *scaled = ctx->scratch + width;
                     for (size_t x = 0; x < count; ++x)
-                        scaled[x] = (uint8_t)((columns[x] * row + 127) / 255);
-                    coverage = scaled;
+                        combined[x] = (uint8_t)((columns[x] * row + 127) / 255);
+                    coverage = combined;
                 }
             }
-            coverage = plane_apply(&plane, ctx->scratch + width, coverage, hit.x0, y, count);
-            uint8_t *dst = pixels + (size_t)y * stride + (size_t)hit.x0 * bpp;
+
+            coverage = clip_apply(state, &plane, combined, temp, coverage, rowX0, y, count);
+            uint8_t *dst = pixels + (size_t)y * stride + (size_t)rowX0 * bpp;
             if (format == RASTER_GRAY8)
                 raster_fill_row_gray(dst, gray, count, blend, alpha8, coverage);
             else
@@ -640,23 +859,40 @@ raster_status raster_context_draw_image(raster_context *ctx, const raster_surfac
     if (raster_surface_format(image) != raster_surface_format(ctx->target))
         return RASTER_UNSUPPORTED_FORMAT;
 
+    // A selector, not a gate. The sampler itself has always been general affine -- it
+    // evaluates the source coordinate from the full inverse per pixel, and applies the kernel
+    // in source space -- so only the destination extent ever needed a second path.
     raster_matrix canonical;
-    if (!raster_matrix_is_rectilinear(ctx->state.ctm, rect, &canonical))
-        return RASTER_UNSUPPORTED_TRANSFORM;
+    bool rectilinear = raster_matrix_is_rectilinear(ctx->state.ctm, rect, &canonical);
+    if (!rectilinear) canonical = ctx->state.ctm;
 
+    // The canonical matrix, not the raw one. These disagreed before -- this call took
+    // ctx->state.ctm while raster_device_box two lines down took the canonical form -- and it
+    // was invisible only because raster_image_mapping canonicalises again internally. It still
+    // does, so passing the raw matrix here survives every test; the change is defensive, and
+    // the thing it defends against is someone later deciding that the callers canonicalise so
+    // the callee need not. A quarter turn's 6.1e-17 reaching the composition costs the
+    // bit-exact permutation that a memcmp over a whole 4000x4000 buffer depends on.
     raster_matrix deviceToImage;
-    if (!raster_image_mapping(ctx->state.ctm, rect, raster_surface_width(image),
+    if (!raster_image_mapping(canonical, rect, raster_surface_width(image),
                               raster_surface_height(image), &deviceToImage))
         return RASTER_OK;  // degenerate, not a failure
 
-    double box[4];
-    if (!raster_device_box(canonical, rect, box)) return RASTER_OK;
-
     bool antialias = ctx->state.antialias;
+    double box[4];
+    raster_quad quad;
     raster_rect area;
-    bool any = antialias ? raster_device_rect_touched(canonical, rect, &area)
-                         : raster_device_rect_covered(canonical, rect, &area);
-    if (!any) return RASTER_OK;
+    if (rectilinear) {
+        if (!raster_device_box(canonical, rect, box)) return RASTER_OK;
+        bool any = antialias ? raster_device_rect_touched(canonical, rect, &area)
+                             : raster_device_rect_covered(canonical, rect, &area);
+        if (!any) return RASTER_OK;
+    } else {
+        if (!raster_quad_make(canonical, rect, &quad)) return RASTER_OK;
+        bool any = antialias ? raster_quad_touched_bounds(&quad, &area)
+                             : raster_quad_covered_bounds(&quad, &area);
+        if (!any) return RASTER_OK;
+    }
 
     // Before a single source byte is read. If `image` is a live snapshot of this very
     // context — which DownsampleCache does deliberately: snapshot, crop one row, draw it
@@ -675,16 +911,19 @@ raster_status raster_context_draw_image(raster_context *ctx, const raster_surfac
     raster_blend blend = ctx->state.blend;
 
     size_t width = (size_t)(area.x1 - area.x0);
-    // A row of resampled source, a row of column coverage, and a scratch row for the two
-    // partial edge rows an antialiased draw has.
-    if (!scratch_reserve(ctx, width * (bpp + 2))) return RASTER_OUT_OF_MEMORY;
+    // A row of resampled source, a row of column coverage, the row being combined, and a
+    // temporary for one shape's contribution.
+    if (!scratch_reserve(ctx, width * (bpp + 3))) return RASTER_OUT_OF_MEMORY;
     uint8_t *samples = ctx->scratch;
     uint8_t *columnCoverage = ctx->scratch + width * bpp;
-    uint8_t *scaledCoverage = columnCoverage + width;
-    if (antialias) raster_axis_coverage(box[0], box[2], area.x0, area.x1, columnCoverage);
+    uint8_t *combined = columnCoverage + width;
+    uint8_t *temp = combined + width;
+    if (rectilinear && antialias)
+        raster_axis_coverage(box[0], box[2], area.x0, area.x1, columnCoverage);
 
-    const raster_region *clip = ctx->state.clip->region;
-    coverage_plane plane = clip_plane(ctx->state.clip);
+    const raster_clip *state = ctx->state.clip;
+    const raster_region *clip = state->region;
+    coverage_plane plane = clip_plane(state);
     size_t clipCount = raster_region_count(clip);
     for (size_t i = 0; i < clipCount; ++i) {
         raster_rect band = raster_region_rect(clip, i);
@@ -694,10 +933,30 @@ raster_status raster_context_draw_image(raster_context *ctx, const raster_surfac
         };
         if (raster_rect_is_empty(hit)) continue;
 
-        size_t count = (size_t)(hit.x1 - hit.x0);
         for (int32_t y = hit.y0; y < hit.y1; ++y) {
+            int32_t rowX0 = hit.x0;
+            size_t count = (size_t)(hit.x1 - hit.x0);
             const uint8_t *coverage = NULL;
-            if (antialias) {
+
+            if (!rectilinear) {
+                if (antialias) {
+                    raster_quad_coverage_row(&quad, rowX0, y, count, combined);
+                    coverage = combined;
+                } else {
+                    // Narrow to the span rather than sampling the whole bounding row. Not just
+                    // waste: raster_sample_row replicates the source's edge outside it, so a
+                    // bounding-box row with non-zero coverage would smear the image's border
+                    // across the box. The narrowing happens after the intersection with the
+                    // clip band, which keeps plane_apply inside its buffer.
+                    int32_t spanLo, spanHi;
+                    if (!raster_quad_row_span(&quad, y, &spanLo, &spanHi)) continue;
+                    if (spanLo < rowX0) spanLo = rowX0;
+                    if (spanHi > hit.x1) spanHi = hit.x1;
+                    if (spanHi <= spanLo) continue;
+                    rowX0 = spanLo;
+                    count = (size_t)(spanHi - spanLo);
+                }
+            } else if (antialias) {
                 uint8_t row;
                 raster_axis_coverage(box[1], box[3], y, y + 1, &row);
                 if (row == 0) continue;
@@ -706,14 +965,15 @@ raster_status raster_context_draw_image(raster_context *ctx, const raster_surfac
                     coverage = columns;
                 } else {
                     for (size_t x = 0; x < count; ++x)
-                        scaledCoverage[x] = (uint8_t)((columns[x] * row + 127) / 255);
-                    coverage = scaledCoverage;
+                        combined[x] = (uint8_t)((columns[x] * row + 127) / 255);
+                    coverage = combined;
                 }
             }
-            coverage = plane_apply(&plane, scaledCoverage, coverage, hit.x0, y, count);
-            raster_sample_row(image, deviceToImage, hit.x0, y, count,
+
+            coverage = clip_apply(state, &plane, combined, temp, coverage, rowX0, y, count);
+            raster_sample_row(image, deviceToImage, rowX0, y, count,
                               ctx->state.interpolation, samples);
-            uint8_t *dst = pixels + (size_t)y * stride + (size_t)hit.x0 * bpp;
+            uint8_t *dst = pixels + (size_t)y * stride + (size_t)rowX0 * bpp;
             if (format == RASTER_GRAY8)
                 raster_blend_row_gray(dst, samples, count, blend, alpha8, coverage);
             else

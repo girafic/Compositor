@@ -358,6 +358,12 @@ bool raster_quad_row_span(const raster_quad *quad, int32_t y, int32_t *x0, int32
 // avoid materialising a coverage plane it may never read.
 bool raster_quad_covered_bounds(const raster_quad *quad, raster_rect *out);
 
+// The device pixels the parallelogram overlaps with positive area — floor on the near edge,
+// ceil on the far one, matching raster_device_rect_touched. This is what an antialiased draw
+// writes; the covered set would cut the boundary pixels away before the coverage could soften
+// them. False when the shape is degenerate.
+bool raster_quad_touched_bounds(const raster_quad *quad, raster_rect *out);
+
 // Exact area coverage of each pixel in `[x0, x0 + count)` of row `y`: the area of the pixel
 // square intersected with the parallelogram, in 0...255.
 //
